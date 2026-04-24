@@ -1,0 +1,11 @@
+services:
+  bean-bot:
+    build: .
+    container_name: bean-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr-bean-bot
+    restart: unless-stopped

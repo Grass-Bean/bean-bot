@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    /* 1. Environment & Output */
+    "target": "ES2022",                // Node 18+ supports this; essential for advanced bot logic
+    "module": "NodeNext",              // Enables native ESM (import/export) in Node
+    "moduleResolution": "NodeNext",
+    "lib": ["ESNext"],                 // unlocks latest JS features
+    "outDir": "./dist",                // Compiled bot goes here
+    "rootDir": "./src",                // Source code lives here
+    
+    /* 2. Strictness & Safety */
+    "strict": true,                    // Essential for type-safety with Discord.js objects
+    "noImplicitAny": true,             // Prevents "any" type leaks
+    "strictNullChecks": true,          // Prevents crashing on null values (common in API responses)
+    
+    /* 3. Bot Development Quality of Life */
+    "sourceMap": true,                 // CRITICAL: Gives you line numbers in TS files when the bot crashes
+    "resolveJsonModule": true,         // Allows importing config.json directly
+    "esModuleInterop": true,           // Fixes imports for older libraries
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true               // Speeds up compile time
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
