@@ -365,7 +365,6 @@ export class GuildAudioSessionManager {
 
     private async startNext(session: GuildAudioSession): Promise<void> {
         if (session.closing || session.current) return;
-        this.clearInactivityTimer(session);
         this.clearTrackWatchdog(session);
 
         while (!session.closing) {
@@ -375,6 +374,7 @@ export class GuildAudioSessionManager {
                 return;
             }
 
+            this.clearInactivityTimer(session);
             const { track, announcementChannel } = queuedTrack;
             session.announcementChannel = announcementChannel;
 
