@@ -1,6 +1,20 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, TextChannel } from 'discord.js';
 import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
-import { trackResolver } from '../../audio/TrackResolver.js';
+import { TrackResolverError, trackResolver } from '../../audio/TrackResolver.js';
+
+const getResolverErrorMessage = (error: TrackResolverError): string => {
+    switch (error.code) {
+        case 'INVALID_INPUT':
+        case 'UNSUPPORTED_URL':
+            return error.message;
+        case 'TIMEOUT':
+            return 'The media lookup timed out. Please try again.';
+        case 'CANCELLED':
+            return 'The media lookup was cancelled.';
+        default:
+            return 'Failed to find or inspect the requested media.';
+    }
+};
 
 export default {
     data: new SlashCommandBuilder()
@@ -38,8 +52,18 @@ export default {
             }
 
         } catch (error) {
-            console.error(error);
-            await interaction.editReply('Failed to find or play video!');
+            if (error instanceof TrackResolverError) {
+                if (error.code !== 'INVALID_INPUT' && error.code !== 'UNSUPPORTED_URL') {
+                    console.error(`[TrackResolver ${error.code}] ${error.message}`);
+                }
+            } else {
+                console.error(error);
+            }
+
+            const message = error instanceof TrackResolverError
+                ? getResolverErrorMessage(error)
+                : 'Failed to find or play the requested media.';
+            await interaction.editReply(message);
         }
     }
 }

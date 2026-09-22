@@ -5,7 +5,7 @@ export interface TrackMetadata {
     id: string;
     title: string;
     url: string;
-    duration?: string;
+    duration?: number;
     thumbnail?: string;
     requestedBy: string;
 }

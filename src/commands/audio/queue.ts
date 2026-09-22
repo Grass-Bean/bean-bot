@@ -9,7 +9,21 @@ import {
     ComponentType
 } from 'discord.js';
 import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
-import { TrackMetadata } from '../../audio/types.js';
+import type { TrackMetadata } from '../../audio/types.js';
+
+const formatDuration = (durationSeconds: number | undefined): string => {
+    if (durationSeconds === undefined) return '';
+
+    const totalSeconds = Math.floor(durationSeconds);
+    const hours = Math.floor(totalSeconds / 3_600);
+    const minutes = Math.floor((totalSeconds % 3_600) / 60);
+    const seconds = totalSeconds % 60;
+    const formatted = hours > 0
+        ? `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
+        : `${minutes}:${seconds.toString().padStart(2, '0')}`;
+
+    return ` \`[${formatted}]\``;
+};
 
 export default {
     data: new SlashCommandBuilder()
@@ -44,7 +58,7 @@ export default {
                 const pageItems = allItems.slice(start, end);
 
                 const description = pageItems.map((item: TrackMetadata, i: number) => {
-                    const duration = item.duration ? ` \`[${item.duration}]\`` : '';
+                    const duration = formatDuration(item.duration);
                     const absoluteIndex = start + i + 1;
                     const status = currentTrack?.id === item.id ? ' **(Now Playing)**' : '';
                     return `**${absoluteIndex}.** [${item.title}](${item.url})${duration} • <@${item.requestedBy}>${status}`;
