@@ -1,16 +1,14 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, MessageFlags } from 'discord.js';
-import { GuildVC } from '../../utility/guildvc.js';
+import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
 
 export default {
     data: new SlashCommandBuilder()
         .setName('skip')
         .setDescription('Skips the currently playing audio track'),
     async execute(interaction: ChatInputCommandInteraction) {
-        const player = GuildVC.getAudioPlayer(interaction.guildId!);
-        if (!player) {
-            return interaction.reply({ content: "No audio player found for this guild.", ephemeral: true });
+        if (!guildAudioSessionManager.skip(interaction.guildId!)) {
+            return interaction.reply({ content: "No audio track is currently playing.", ephemeral: true });
         }
-        player.stop();
         await interaction.reply("Skipped the current track.");
     }
 }

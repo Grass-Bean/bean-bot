@@ -1,5 +1,5 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, MessageFlags } from 'discord.js';
-import { GuildVC } from '../../utility/guildvc.js';
+import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
 
 export default {
     data: new SlashCommandBuilder()
@@ -18,11 +18,14 @@ export default {
 
         // 2. disconnect
         try {
-            if (GuildVC.disconnect(
-                interaction.guild.id
-            )) {
+            if (guildAudioSessionManager.disconnect(interaction.guild.id)) {
                 await interaction.reply({ 
                     content: `Disconnected from the voice channel!`, 
+                });
+            } else {
+                await interaction.reply({
+                    content: 'The bot is not connected to a voice channel.',
+                    flags: MessageFlags.Ephemeral
                 });
             }
         } catch (error) {

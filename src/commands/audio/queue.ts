@@ -8,7 +8,8 @@ import {
     ButtonInteraction,
     ComponentType
 } from 'discord.js';
-import { GuildVC } from '../../utility/guildvc.js';
+import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
+import { TrackMetadata } from '../../audio/types.js';
 
 export default {
     data: new SlashCommandBuilder()
@@ -19,11 +20,9 @@ export default {
         // 1. Defer reply
         if (!interaction.deferred && !interaction.replied) await interaction.deferReply();
 
-        const audioQueue = GuildVC.getAudioQueue(interaction.guildId!);
-        
-        // Retrieve items
-        // @ts-ignore
-        const allItems = audioQueue.toArray ? audioQueue.toArray() : Array.from(audioQueue);
+        const snapshot = guildAudioSessionManager.getSnapshot(interaction.guildId!);
+        const currentTrack = snapshot.current?.kind === 'track' ? snapshot.current : undefined;
+        const allItems = currentTrack ? [currentTrack, ...snapshot.pending] : [...snapshot.pending];
 
         // --- Pagination Settings ---
         const itemsPerPage = 10;
@@ -44,10 +43,11 @@ export default {
                 const end = start + itemsPerPage;
                 const pageItems = allItems.slice(start, end);
 
-                const description = pageItems.map((item: any, i: number) => {
+                const description = pageItems.map((item: TrackMetadata, i: number) => {
                     const duration = item.duration ? ` \`[${item.duration}]\`` : '';
                     const absoluteIndex = start + i + 1;
-                    return `**${absoluteIndex}.** [${item.title}](${item.url})${duration} • <@${item.requestedBy || 'Unknown'}>`;
+                    const status = currentTrack?.id === item.id ? ' **(Now Playing)**' : '';
+                    return `**${absoluteIndex}.** [${item.title}](${item.url})${duration} • <@${item.requestedBy}>${status}`;
                 }).join('\n');
 
                 embed.setDescription(description);

@@ -1,5 +1,5 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, MessageFlags} from 'discord.js';
-import { joinVoiceChannel } from '../../utility/joinvoice.js';
+import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
 
 export default {
     data: new SlashCommandBuilder()
@@ -7,7 +7,7 @@ export default {
         .setDescription('Connects the bot to your current voice channel'),
         
     async execute(interaction: ChatInputCommandInteraction) {
-        const connection = await joinVoiceChannel(interaction);
+        const connection = await guildAudioSessionManager.connectForInteraction(interaction);
         if (connection) {
             await interaction.reply({ 
                 content: 'Connected to voice channel! 🔊', 
