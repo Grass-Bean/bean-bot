@@ -24,7 +24,7 @@ interface GuildAudioSession {
     channelId: string;
     connection: VoiceConnection;
     player: AudioPlayer;
-    queue: Deque<TrackMetadata>;
+    queue: Deque<QueuedTrack>;
     current?: BeanAudioResource;
     preload?: BeanAudioResource;
     inactivityTimer?: NodeJS.Timeout;
@@ -34,6 +34,11 @@ interface GuildAudioSession {
     recovery?: Promise<void>;
     hasBeenReady: boolean;
     closing: boolean;
+}
+
+interface QueuedTrack {
+    track: TrackMetadata;
+    announcementChannel: TextChannel | null;
 }
 
 export class GuildAudioSessionManager {
@@ -82,7 +87,7 @@ export class GuildAudioSessionManager {
             channelId,
             connection,
             player,
-            queue: new Deque<TrackMetadata>(),
+            queue: new Deque<QueuedTrack>(),
             announcementChannel: null,
             transition: Promise.resolve(),
             hasBeenReady: false,
@@ -220,13 +225,12 @@ export class GuildAudioSessionManager {
         const session = this.requireSession(guildId);
         const queueWasEmpty = session.queue.size() === 0;
         const currentKind = session.current?.metadata.kind;
-        if (!session.queue.pushBack(track)) {
+        if (!session.queue.pushBack({ track, announcementChannel: channel })) {
             return { accepted: false, startsImmediately: false, position: MAX_QUEUE_SIZE };
         }
 
         const startsImmediately = queueWasEmpty && (!session.current || currentKind === 'elevator');
 
-        session.announcementChannel = channel;
         this.clearInactivityTimer(session);
         const position = startsImmediately ? 0 : session.queue.size();
 
@@ -271,7 +275,7 @@ export class GuildAudioSessionManager {
 
         return {
             current: session.current ? { ...session.current.metadata } : undefined,
-            pending: session.queue.toArray().map((track) => ({ ...track }))
+            pending: session.queue.toArray().map(({ track }) => ({ ...track }))
         };
     }
 
@@ -351,7 +355,7 @@ export class GuildAudioSessionManager {
         this.resources.release(session.preload);
         session.current = undefined;
         session.preload = undefined;
-        session.queue = new Deque<TrackMetadata>();
+        session.queue = new Deque<QueuedTrack>();
 
         if (destroyConnection && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
             session.connection.destroy();
@@ -365,11 +369,14 @@ export class GuildAudioSessionManager {
         this.clearTrackWatchdog(session);
 
         while (!session.closing) {
-            const track = session.queue.popFront();
-            if (!track) {
+            const queuedTrack = session.queue.popFront();
+            if (!queuedTrack) {
                 this.startElevatorMusic(session);
                 return;
             }
+
+            const { track, announcementChannel } = queuedTrack;
+            session.announcementChannel = announcementChannel;
 
             try {
                 const resource = this.takePreload(session, track) ?? this.resources.createTrackResource(track);
@@ -409,14 +416,16 @@ export class GuildAudioSessionManager {
     }
 
     private reconcilePreload(session: GuildAudioSession): void {
-        const nextTrack = session.queue.peekFront();
+        const nextQueuedTrack = session.queue.peekFront();
         const currentPreload = session.preload;
 
-        if (!nextTrack) {
+        if (!nextQueuedTrack) {
             this.resources.release(currentPreload);
             session.preload = undefined;
             return;
         }
+
+        const { track: nextTrack } = nextQueuedTrack;
 
         if (
             currentPreload?.metadata.kind === 'track' &&
