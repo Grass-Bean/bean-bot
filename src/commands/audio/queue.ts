@@ -6,7 +6,8 @@ import {
     ButtonBuilder,
     ButtonStyle,
     ButtonInteraction,
-    ComponentType
+    ComponentType,
+    escapeMarkdown
 } from 'discord.js';
 import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
 import type { TrackMetadata } from '../../audio/types.js';
@@ -38,10 +39,29 @@ export default {
         const currentTrack = snapshot.current?.kind === 'track' ? snapshot.current : undefined;
         const allItems = currentTrack ? [currentTrack, ...snapshot.pending] : [...snapshot.pending];
 
-        // --- Pagination Settings ---
-        const itemsPerPage = 10;
+        const maxItemsPerPage = 10;
+        const maxDescriptionLength = 3_900;
+        const lines = allItems.map((item: TrackMetadata, index: number) => {
+            const duration = formatDuration(item.duration);
+            const status = currentTrack?.id === item.id ? ' **(Now Playing)**' : '';
+            const safeTitle = escapeMarkdown(item.title);
+            const safeUrl = item.url.replace(/\\/g, '%5C').replace(/\(/g, '%28').replace(/\)/g, '%29');
+            return `**${index + 1}.** [${safeTitle}](${safeUrl})${duration} • <@${item.requestedBy}>${status}`;
+        });
+        const pages: string[][] = [[]];
+
+        for (const line of lines) {
+            const currentPageLines = pages.at(-1)!;
+            const projectedLength = currentPageLines.join('\n').length + (currentPageLines.length ? 1 : 0) + line.length;
+            if (currentPageLines.length >= maxItemsPerPage || projectedLength > maxDescriptionLength) {
+                pages.push([line]);
+            } else {
+                currentPageLines.push(line);
+            }
+        }
+
         let currentPage = 0;
-        const totalPages = Math.ceil(allItems.length / itemsPerPage) || 1;
+        const totalPages = pages.length;
 
         // --- Helper: Generate Embed ---
         const generateEmbed = (page: number) => {
@@ -53,18 +73,7 @@ export default {
                 embed.setDescription("The queue is currently empty.");
                 embed.setFooter({ text: "Page 1 of 1" });
             } else {
-                const start = page * itemsPerPage;
-                const end = start + itemsPerPage;
-                const pageItems = allItems.slice(start, end);
-
-                const description = pageItems.map((item: TrackMetadata, i: number) => {
-                    const duration = formatDuration(item.duration);
-                    const absoluteIndex = start + i + 1;
-                    const status = currentTrack?.id === item.id ? ' **(Now Playing)**' : '';
-                    return `**${absoluteIndex}.** [${item.title}](${item.url})${duration} • <@${item.requestedBy}>${status}`;
-                }).join('\n');
-
-                embed.setDescription(description);
+                embed.setDescription(pages[page].join('\n'));
                 embed.setFooter({ text: `Page ${page + 1} of ${totalPages} • Total tracks: ${allItems.length}` });
                 embed.setTimestamp();
             }

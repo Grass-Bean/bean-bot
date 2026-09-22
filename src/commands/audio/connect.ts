@@ -7,11 +7,15 @@ export default {
         .setDescription('Connects the bot to your current voice channel'),
         
     async execute(interaction: ChatInputCommandInteraction) {
-        const connection = await guildAudioSessionManager.connectForInteraction(interaction);
+        const voiceChannelId = await guildAudioSessionManager.validateInteractionVoiceChannel(interaction);
+        if (!voiceChannelId) return;
+
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+        const connection = await guildAudioSessionManager.connectForInteraction(interaction, voiceChannelId);
         if (connection) {
-            await interaction.reply({ 
-                content: 'Connected to voice channel! 🔊', 
-                flags: MessageFlags.Ephemeral 
+            await interaction.editReply({
+                content: 'Connected to voice channel! 🔊',
+                allowedMentions: { parse: [] }
             });
         }
     }

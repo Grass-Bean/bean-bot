@@ -18,6 +18,8 @@ export default {
 
         // 2. disconnect
         try {
+            if (!await guildAudioSessionManager.canControlFromInteraction(interaction)) return;
+
             if (guildAudioSessionManager.disconnect(interaction.guild.id)) {
                 await interaction.reply({ 
                     content: `Disconnected from the voice channel!`, 

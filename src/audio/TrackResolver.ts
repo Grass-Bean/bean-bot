@@ -12,6 +12,8 @@ interface YtDlpMetadata {
 const MAX_STDERR_BYTES = 8_000;
 const MAX_TIMER_MS = 2_147_483_647;
 const MAX_CONFIGURED_STDOUT_BYTES = 16 * 1024 * 1024;
+const MAX_TRACK_TITLE_CHARACTERS = 200;
+const MAX_TRACK_URL_CHARACTERS = 1_000;
 const ALLOWED_MEDIA_HOSTS = ['youtube.com', 'youtube-nocookie.com', 'instagram.com'];
 const ALLOWED_SHORT_LINK_HOSTS = new Set(['youtu.be', 'instagr.am']);
 
@@ -104,6 +106,26 @@ const normalizeHttpUrl = (value: string | null | undefined): string | undefined 
     } catch {
         return undefined;
     }
+};
+
+const normalizeMediaUrl = (value: string): string | undefined => {
+    const normalized = normalizeHttpUrl(value);
+    if (!normalized || normalized.length > MAX_TRACK_URL_CHARACTERS) return undefined;
+
+    const url = new URL(normalized);
+    if (url.username || url.password || !isAllowedMediaHost(url.hostname)) return undefined;
+    return normalized;
+};
+
+const normalizeTrackTitle = (value: string): string | undefined => {
+    const normalized = value
+        .replace(/[\u0000-\u001F\u007F-\u009F]+/g, ' ')
+        .trim();
+    if (!normalized) return undefined;
+
+    const characters = Array.from(normalized);
+    if (characters.length <= MAX_TRACK_TITLE_CHARACTERS) return normalized;
+    return `${characters.slice(0, MAX_TRACK_TITLE_CHARACTERS - 1).join('')}…`;
 };
 
 const asError = (value: unknown): Error => (
@@ -300,11 +322,21 @@ export class TrackResolver {
                     return;
                 }
 
+                const title = normalizeTrackTitle(data.title);
+                const mediaUrl = normalizeMediaUrl(data.webpage_url);
+                if (!title || !mediaUrl) {
+                    rejectOnce(new TrackResolverError(
+                        'yt-dlp returned unsafe track metadata.',
+                        'INVALID_RESPONSE'
+                    ));
+                    return;
+                }
+
                 resolveOnce({
                     kind: 'track',
                     id: randomUUID(),
-                    title: data.title.trim(),
-                    url: data.webpage_url,
+                    title,
+                    url: mediaUrl,
                     duration: data.duration ?? undefined,
                     thumbnail: normalizeHttpUrl(data.thumbnail),
                     requestedBy

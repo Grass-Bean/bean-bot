@@ -25,6 +25,7 @@ export interface AudioQueueSnapshot {
 }
 
 export interface EnqueueResult {
+    accepted: boolean;
     startsImmediately: boolean;
     position: number;
 }

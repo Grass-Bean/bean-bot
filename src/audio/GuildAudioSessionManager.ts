@@ -3,11 +3,13 @@ import {
     AudioPlayerStatus,
     createAudioPlayer,
     DiscordGatewayAdapterCreator,
+    entersState,
     joinVoiceChannel,
-    VoiceConnection
+    VoiceConnection,
+    VoiceConnectionStatus
 } from '@discordjs/voice';
-import { ChatInputCommandInteraction, GuildMember, MessageFlags, TextChannel } from 'discord.js';
-import { Deque } from './Deque.js';
+import { ChatInputCommandInteraction, escapeMarkdown, GuildMember, MessageFlags, TextChannel } from 'discord.js';
+import { Deque, MAX_QUEUE_SIZE } from './Deque.js';
 import { audioResourceManager, AudioResourceManager } from './AudioResourceManager.js';
 import {
     AudioMetadata,
@@ -19,6 +21,7 @@ import {
 
 interface GuildAudioSession {
     guildId: string;
+    channelId: string;
     connection: VoiceConnection;
     player: AudioPlayer;
     queue: Deque<TrackMetadata>;
@@ -27,6 +30,7 @@ interface GuildAudioSession {
     inactivityTimer?: NodeJS.Timeout;
     announcementChannel: TextChannel | null;
     transition: Promise<void>;
+    recovery?: Promise<void>;
     closing: boolean;
 }
 
@@ -35,16 +39,23 @@ export class GuildAudioSessionManager {
 
     public constructor(
         private readonly resources: AudioResourceManager = audioResourceManager,
-        private readonly inactivityTimeoutMs = 5 * 60 * 1000
+        private readonly inactivityTimeoutMs = 5 * 60 * 1000,
+        private readonly connectionReadyTimeoutMs = 15_000,
+        private readonly connectionRecoveryTimeoutMs = 5_000
     ) {}
 
-    public connect(
+    public async connect(
         guildId: string,
         channelId: string,
         adapterCreator: DiscordGatewayAdapterCreator
-    ): VoiceConnection {
+    ): Promise<VoiceConnection> {
         const existing = this.sessions.get(guildId);
-        if (existing && !existing.closing) return existing.connection;
+        if (existing && !existing.closing) {
+            if (existing.channelId !== channelId) {
+                throw new Error(`Audio is already active in voice channel ${existing.channelId}.`);
+            }
+            return this.awaitReady(existing);
+        }
 
         const connection = joinVoiceChannel({
             channelId,
@@ -56,6 +67,7 @@ export class GuildAudioSessionManager {
         const player = createAudioPlayer();
         const session: GuildAudioSession = {
             guildId,
+            channelId,
             connection,
             player,
             queue: new Deque<TrackMetadata>(),
@@ -80,61 +92,111 @@ export class GuildAudioSessionManager {
             const metadata = error.resource.metadata as AudioMetadata | null;
             console.error(`Audio player error in guild ${guildId} (${metadata?.title ?? 'unknown resource'}):`, error);
             if (metadata?.kind === 'track') {
-                this.notify(session, `⚠️ Could not play **${metadata.title}**. Skipping...`);
+                this.notify(session, `⚠️ Could not play **${escapeMarkdown(metadata.title)}**. Skipping...`);
             }
+        });
+
+        connection.on('error', (error) => {
+            console.error(`Voice connection error in guild ${guildId}:`, error);
+        });
+        connection.on(VoiceConnectionStatus.Disconnected, () => {
+            void this.recoverConnection(session);
+        });
+        connection.on(VoiceConnectionStatus.Destroyed, () => {
+            this.closeSession(session, false);
         });
 
         connection.subscribe(player);
         this.sessions.set(guildId, session);
-        return connection;
+
+        try {
+            return await this.awaitReady(session);
+        } catch (error) {
+            this.closeSession(session, true);
+            throw error;
+        }
+    }
+
+    public async validateInteractionVoiceChannel(
+        interaction: ChatInputCommandInteraction,
+        expectedChannelId?: string
+    ): Promise<string | undefined> {
+        if (!interaction.guild || !interaction.member) {
+            await this.respondToInteraction(interaction, 'This command can only be used in a server.');
+            return undefined;
+        }
+
+        let member: GuildMember;
+        try {
+            member = interaction.member instanceof GuildMember
+                ? interaction.member
+                : await interaction.guild.members.fetch(interaction.user.id);
+        } catch (error) {
+            console.error(`Failed to resolve member voice state in guild ${interaction.guild.id}:`, error);
+            await this.respondToInteraction(interaction, 'Could not determine your voice channel.');
+            return undefined;
+        }
+
+        const voiceChannelId = member.voice.channelId;
+        if (!voiceChannelId) {
+            await this.respondToInteraction(interaction, 'You need to be in a voice channel to use this command.');
+            return undefined;
+        }
+
+        if (expectedChannelId && expectedChannelId !== voiceChannelId) {
+            await this.respondToInteraction(interaction, 'Your voice channel changed while the command was running. Please try again.');
+            return undefined;
+        }
+
+        const existing = this.sessions.get(interaction.guild.id);
+        if (existing && !existing.closing && existing.channelId !== voiceChannelId) {
+            await this.respondToInteraction(
+                interaction,
+                `The bot is already active in <#${existing.channelId}>. Join that voice channel to control it.`
+            );
+            return undefined;
+        }
+
+        return voiceChannelId;
     }
 
     public async connectForInteraction(
-        interaction: ChatInputCommandInteraction
+        interaction: ChatInputCommandInteraction,
+        expectedChannelId?: string
     ): Promise<VoiceConnection | undefined> {
-        if (!interaction.guild || !interaction.member) {
-            await interaction.reply({
-                content: 'This command can only be used in a server.',
-                flags: MessageFlags.Ephemeral
-            });
-            return undefined;
-        }
-
-        const member = interaction.member as GuildMember;
-        const voiceChannel = member.voice.channel;
-        if (!voiceChannel) {
-            await interaction.reply({
-                content: 'You need to be in a voice channel to use this command.',
-                flags: MessageFlags.Ephemeral
-            });
-            return undefined;
-        }
+        const voiceChannelId = await this.validateInteractionVoiceChannel(interaction, expectedChannelId);
+        if (!voiceChannelId || !interaction.guild) return undefined;
 
         try {
-            return this.connect(
+            return await this.connect(
                 interaction.guild.id,
-                voiceChannel.id,
+                voiceChannelId,
                 interaction.guild.voiceAdapterCreator
             );
         } catch (error) {
             console.error(`Failed to connect to voice in guild ${interaction.guild.id}:`, error);
-            await interaction.reply({
-                content: 'Failed to connect to the voice channel.',
-                flags: MessageFlags.Ephemeral
-            });
+            await this.respondToInteraction(interaction, 'Failed to connect to the voice channel.');
             return undefined;
         }
+    }
+
+    public async canControlFromInteraction(interaction: ChatInputCommandInteraction): Promise<boolean> {
+        if (!interaction.guildId || !this.sessions.has(interaction.guildId)) return true;
+        return (await this.validateInteractionVoiceChannel(interaction)) !== undefined;
     }
 
     public enqueue(guildId: string, track: TrackMetadata, channel: TextChannel | null): EnqueueResult {
         const session = this.requireSession(guildId);
         const queueWasEmpty = session.queue.size() === 0;
         const currentKind = session.current?.metadata.kind;
+        if (!session.queue.pushBack(track)) {
+            return { accepted: false, startsImmediately: false, position: MAX_QUEUE_SIZE };
+        }
+
         const startsImmediately = queueWasEmpty && (!session.current || currentKind === 'elevator');
 
         session.announcementChannel = channel;
         this.clearInactivityTimer(session);
-        session.queue.pushBack(track);
         const position = startsImmediately ? 0 : session.queue.size();
 
         if (currentKind === 'elevator') {
@@ -157,7 +219,7 @@ export class GuildAudioSessionManager {
             });
         }
 
-        return { startsImmediately, position };
+        return { accepted: true, startsImmediately, position };
     }
 
     public skip(guildId: string): boolean {
@@ -169,20 +231,7 @@ export class GuildAudioSessionManager {
     public disconnect(guildId: string): boolean {
         const session = this.sessions.get(guildId);
         if (!session) return false;
-
-        session.closing = true;
-        this.sessions.delete(guildId);
-        this.clearInactivityTimer(session);
-
-        session.player.removeAllListeners();
-        session.player.stop(true);
-        this.resources.release(session.current);
-        this.resources.release(session.preload);
-        session.current = undefined;
-        session.preload = undefined;
-        session.queue = new Deque<TrackMetadata>();
-        session.connection.destroy();
-        return true;
+        return this.closeSession(session, true);
     }
 
     public getSnapshot(guildId: string): AudioQueueSnapshot {
@@ -215,6 +264,71 @@ export class GuildAudioSessionManager {
         return scheduled;
     }
 
+    private async awaitReady(session: GuildAudioSession): Promise<VoiceConnection> {
+        if (session.connection.state.status === VoiceConnectionStatus.Ready) {
+            return session.connection;
+        }
+
+        return entersState(
+            session.connection,
+            VoiceConnectionStatus.Ready,
+            this.connectionReadyTimeoutMs
+        );
+    }
+
+    private async recoverConnection(session: GuildAudioSession): Promise<void> {
+        if (session.closing || session.recovery) return session.recovery;
+
+        session.recovery = (async () => {
+            try {
+                await Promise.race([
+                    entersState(
+                        session.connection,
+                        VoiceConnectionStatus.Signalling,
+                        this.connectionRecoveryTimeoutMs
+                    ),
+                    entersState(
+                        session.connection,
+                        VoiceConnectionStatus.Connecting,
+                        this.connectionRecoveryTimeoutMs
+                    )
+                ]);
+            } catch (error) {
+                if (this.sessions.get(session.guildId) !== session || session.closing) return;
+                console.error(`Voice connection recovery failed in guild ${session.guildId}:`, error);
+                this.notify(session, '⚠️ Voice connection was lost. Disconnecting the audio session.');
+                this.closeSession(session, true);
+            } finally {
+                session.recovery = undefined;
+            }
+        })();
+
+        return session.recovery;
+    }
+
+    private closeSession(session: GuildAudioSession, destroyConnection: boolean): boolean {
+        if (session.closing) return false;
+
+        session.closing = true;
+        if (this.sessions.get(session.guildId) === session) {
+            this.sessions.delete(session.guildId);
+        }
+        this.clearInactivityTimer(session);
+
+        session.player.removeAllListeners();
+        session.player.stop(true);
+        this.resources.release(session.current);
+        this.resources.release(session.preload);
+        session.current = undefined;
+        session.preload = undefined;
+        session.queue = new Deque<TrackMetadata>();
+
+        if (destroyConnection && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
+            session.connection.destroy();
+        }
+        return true;
+    }
+
     private async startNext(session: GuildAudioSession): Promise<void> {
         if (session.closing || session.current) return;
         this.clearInactivityTimer(session);
@@ -230,14 +344,17 @@ export class GuildAudioSessionManager {
                 const resource = this.takePreload(session, track) ?? this.resources.createTrackResource(track);
                 session.current = resource;
                 session.player.play(resource);
-                this.notify(session, `🎶 **Now Playing:** ${resource.metadata.title}\n🔗 ${resource.metadata.kind === 'track' ? resource.metadata.url : ''}`);
+                this.notify(
+                    session,
+                    `🎶 **Now Playing:** ${escapeMarkdown(resource.metadata.title)}\n🔗 ${resource.metadata.kind === 'track' ? resource.metadata.url : ''}`
+                );
                 this.reconcilePreload(session);
                 return;
             } catch (error) {
                 console.error(`Failed to play ${track.title} in guild ${session.guildId}:`, error);
                 this.resources.release(session.current);
                 session.current = undefined;
-                this.notify(session, `⚠️ Could not play **${track.title}**. Skipping...`);
+                this.notify(session, `⚠️ Could not play **${escapeMarkdown(track.title)}**. Skipping...`);
             }
         }
     }
@@ -318,9 +435,30 @@ export class GuildAudioSessionManager {
     }
 
     private notify(session: GuildAudioSession, message: string): void {
-        void session.announcementChannel?.send(message).catch((error) => {
+        void session.announcementChannel?.send({
+            content: message,
+            allowedMentions: { parse: [] }
+        }).catch((error) => {
             console.error(`Failed to send audio notification in guild ${session.guildId}:`, error);
         });
+    }
+
+    private async respondToInteraction(
+        interaction: ChatInputCommandInteraction,
+        content: string
+    ): Promise<void> {
+        const response = {
+            content,
+            allowedMentions: { parse: [] }
+        };
+
+        if (interaction.deferred) {
+            await interaction.editReply(response);
+        } else if (interaction.replied) {
+            await interaction.followUp({ ...response, flags: MessageFlags.Ephemeral });
+        } else {
+            await interaction.reply({ ...response, flags: MessageFlags.Ephemeral });
+        }
     }
 }
 

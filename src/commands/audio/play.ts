@@ -1,4 +1,4 @@
-import { SlashCommandBuilder, ChatInputCommandInteraction, TextChannel } from 'discord.js';
+import { SlashCommandBuilder, ChatInputCommandInteraction, escapeMarkdown, TextChannel } from 'discord.js';
 import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
 import { TrackResolverError, trackResolver } from '../../audio/TrackResolver.js';
 
@@ -28,8 +28,8 @@ export default {
         
     async execute(interaction: ChatInputCommandInteraction) {
         const guildId = interaction.guildId!;
-        const conn = await guildAudioSessionManager.connectForInteraction(interaction);
-        if (!conn) return;
+        const voiceChannelId = await guildAudioSessionManager.validateInteractionVoiceChannel(interaction);
+        if (!voiceChannelId) return;
 
         const query = interaction.options.getString('query', true);
 
@@ -39,16 +39,34 @@ export default {
 
         try {
             const track = await trackResolver.resolve(query, interaction.user.id);
+            const conn = await guildAudioSessionManager.connectForInteraction(interaction, voiceChannelId);
+            if (!conn) return;
+
             const result = guildAudioSessionManager.enqueue(
                 guildId,
                 track,
                 interaction.channel as TextChannel | null
             );
+            if (!result.accepted) {
+                await interaction.editReply({
+                    content: 'The queue is full (50 tracks). Please try again after a track finishes.',
+                    allowedMentions: { parse: [] }
+                });
+                return;
+            }
+
+            const safeTitle = escapeMarkdown(track.title);
 
             if (result.startsImmediately) {
-                await interaction.editReply(`✅ **Added to queue:** ${track.title}`);
+                await interaction.editReply({
+                    content: `✅ **Added to queue:** ${safeTitle}`,
+                    allowedMentions: { parse: [] }
+                });
             } else {
-                await interaction.editReply(`✅ **Queued:** ${track.title} \n📊 Position: ${result.position}`);
+                await interaction.editReply({
+                    content: `✅ **Queued:** ${safeTitle} \n📊 Position: ${result.position}`,
+                    allowedMentions: { parse: [] }
+                });
             }
 
         } catch (error) {
@@ -63,7 +81,10 @@ export default {
             const message = error instanceof TrackResolverError
                 ? getResolverErrorMessage(error)
                 : 'Failed to find or play the requested media.';
-            await interaction.editReply(message);
+            await interaction.editReply({
+                content: message,
+                allowedMentions: { parse: [] }
+            });
         }
     }
 }
