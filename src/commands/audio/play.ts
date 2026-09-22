@@ -1,6 +1,6 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, TextChannel } from 'discord.js';
 import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
-import { youTubeTrackResolver } from '../../audio/YouTubeTrackResolver.js';
+import { trackResolver } from '../../audio/TrackResolver.js';
 
 export default {
     data: new SlashCommandBuilder()
@@ -24,7 +24,7 @@ export default {
         }
 
         try {
-            const track = await youTubeTrackResolver.resolve(query, interaction.user.id);
+            const track = await trackResolver.resolve(query, interaction.user.id);
             const result = guildAudioSessionManager.enqueue(
                 guildId,
                 track,

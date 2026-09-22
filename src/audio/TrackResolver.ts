@@ -9,24 +9,28 @@ interface YtDlpMetadata {
     thumbnail?: string;
 }
 
-export class YouTubeTrackResolver {
-    public resolve(query: string, requestedBy: string): Promise<TrackMetadata> {
-        const input = query.startsWith('http') ? query : `ytsearch1:${query}`;
+export class TrackResolver {
+    public async resolve(query: string, requestedBy: string): Promise<TrackMetadata> {
+        const input = this.resolveInput(query);
 
-        return new Promise((resolve, reject) => {
+        return new Promise<TrackMetadata>((resolve, reject) => {
             let settled = false;
             const ytProcess = spawn('yt-dlp', [
+                '--ignore-config',
                 '--dump-json',
                 '--no-playlist',
                 '-q',
+                '--',
                 input
-            ]);
+            ], { windowsHide: true });
 
             let stdoutData = '';
             let stderrData = '';
 
             ytProcess.stdout.on('data', (chunk) => { stdoutData += chunk.toString(); });
-            ytProcess.stderr.on('data', (chunk) => { stderrData += chunk.toString(); });
+            ytProcess.stderr.on('data', (chunk) => {
+                stderrData = `${stderrData}${chunk.toString()}`.slice(-8_000);
+            });
 
             ytProcess.once('close', (code) => {
                 if (settled) return;
@@ -67,6 +71,19 @@ export class YouTubeTrackResolver {
             });
         });
     }
+
+    private resolveInput(query: string): string {
+        if (!/^https?:\/\//i.test(query)) return `ytsearch1:${query}`;
+
+        let url: URL;
+        try {
+            url = new URL(query);
+        } catch {
+            throw new Error('The supplied URL is invalid.');
+        }
+
+        return url.toString();
+    }
 }
 
-export const youTubeTrackResolver = new YouTubeTrackResolver();
+export const trackResolver = new TrackResolver();

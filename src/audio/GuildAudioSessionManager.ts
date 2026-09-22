@@ -69,7 +69,7 @@ export class GuildAudioSessionManager {
             void this.schedule(session, async () => {
                 if (session.current !== endedResource) return;
                 if (endedResource) {
-                    this.resources.dispose(endedResource);
+                    this.resources.release(endedResource);
                     session.current = undefined;
                 }
                 await this.startNext(session);
@@ -142,7 +142,7 @@ export class GuildAudioSessionManager {
             if (!stopped) {
                 void this.schedule(session, async () => {
                     if (session.current?.metadata.kind !== 'elevator') return;
-                    this.resources.dispose(session.current);
+                    this.resources.release(session.current);
                     session.current = undefined;
                     await this.startNext(session);
                 });
@@ -176,8 +176,8 @@ export class GuildAudioSessionManager {
 
         session.player.removeAllListeners();
         session.player.stop(true);
-        this.resources.dispose(session.current);
-        this.resources.dispose(session.preload);
+        this.resources.release(session.current);
+        this.resources.release(session.preload);
         session.current = undefined;
         session.preload = undefined;
         session.queue = new Deque<TrackMetadata>();
@@ -235,7 +235,7 @@ export class GuildAudioSessionManager {
                 return;
             } catch (error) {
                 console.error(`Failed to play ${track.title} in guild ${session.guildId}:`, error);
-                this.resources.dispose(session.current);
+                this.resources.release(session.current);
                 session.current = undefined;
                 this.notify(session, `⚠️ Could not play **${track.title}**. Skipping...`);
             }
@@ -250,12 +250,12 @@ export class GuildAudioSessionManager {
         if (
             preload.metadata.kind === 'track' &&
             preload.metadata.id === track.id &&
-            !this.resources.isDisposed(preload)
+            !this.resources.isReleased(preload)
         ) {
             return preload;
         }
 
-        this.resources.dispose(preload);
+        this.resources.release(preload);
         return undefined;
     }
 
@@ -264,7 +264,7 @@ export class GuildAudioSessionManager {
         const currentPreload = session.preload;
 
         if (!nextTrack) {
-            this.resources.dispose(currentPreload);
+            this.resources.release(currentPreload);
             session.preload = undefined;
             return;
         }
@@ -272,12 +272,12 @@ export class GuildAudioSessionManager {
         if (
             currentPreload?.metadata.kind === 'track' &&
             currentPreload.metadata.id === nextTrack.id &&
-            !this.resources.isDisposed(currentPreload)
+            !this.resources.isReleased(currentPreload)
         ) {
             return;
         }
 
-        this.resources.dispose(currentPreload);
+        this.resources.release(currentPreload);
         try {
             session.preload = this.resources.createTrackResource(nextTrack);
         } catch (error) {
@@ -289,7 +289,7 @@ export class GuildAudioSessionManager {
     private startElevatorMusic(session: GuildAudioSession): void {
         if (session.closing || session.current) return;
 
-        this.resources.dispose(session.preload);
+        this.resources.release(session.preload);
         session.preload = undefined;
 
         try {
