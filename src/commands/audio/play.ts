@@ -37,6 +37,14 @@ export default {
             await interaction.deferReply();
         }
 
+        if (guildAudioSessionManager.isQueueFull(guildId)) {
+            await interaction.editReply({
+                content: 'The queue is full (50 tracks). Please try again after a track finishes.',
+                allowedMentions: { parse: [] }
+            });
+            return;
+        }
+
         try {
             const track = await trackResolver.resolve(query, interaction.user.id);
             const conn = await guildAudioSessionManager.connectForInteraction(interaction, voiceChannelId);

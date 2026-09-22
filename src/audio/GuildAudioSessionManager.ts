@@ -28,6 +28,7 @@ interface GuildAudioSession {
     current?: BeanAudioResource;
     preload?: BeanAudioResource;
     inactivityTimer?: NodeJS.Timeout;
+    trackWatchdog?: NodeJS.Timeout;
     announcementChannel: TextChannel | null;
     transition: Promise<void>;
     recovery?: Promise<void>;
@@ -42,7 +43,11 @@ export class GuildAudioSessionManager {
         private readonly resources: AudioResourceManager = audioResourceManager,
         private readonly inactivityTimeoutMs = 5 * 60 * 1000,
         private readonly connectionReadyTimeoutMs = 15_000,
-        private readonly connectionRecoveryTimeoutMs = 15_000
+        private readonly connectionRecoveryTimeoutMs = 15_000,
+        private readonly emptySessionTimeoutMs = 10 * 60 * 1000,
+        private readonly trackStartupTimeoutMs = 20_000,
+        private readonly trackStallTimeoutMs = 30_000,
+        private readonly trackWatchdogIntervalMs = 5_000
     ) {}
 
     public async connect(
@@ -86,6 +91,7 @@ export class GuildAudioSessionManager {
 
         player.on(AudioPlayerStatus.Idle, () => {
             const endedResource = session.current;
+            this.clearTrackWatchdog(session);
             void this.schedule(session, async () => {
                 if (session.current !== endedResource) return;
                 if (endedResource) {
@@ -127,7 +133,9 @@ export class GuildAudioSessionManager {
         this.sessions.set(guildId, session);
 
         try {
-            return await this.awaitReady(session);
+            const readyConnection = await this.awaitReady(session);
+            this.scheduleInactivityDisconnect(session, this.emptySessionTimeoutMs);
+            return readyConnection;
         } catch (error) {
             this.closeSession(session, true);
             throw error;
@@ -201,6 +209,11 @@ export class GuildAudioSessionManager {
     public async canControlFromInteraction(interaction: ChatInputCommandInteraction): Promise<boolean> {
         if (!interaction.guildId || !this.sessions.has(interaction.guildId)) return true;
         return (await this.validateInteractionVoiceChannel(interaction)) !== undefined;
+    }
+
+    public isQueueFull(guildId: string): boolean {
+        const session = this.sessions.get(guildId);
+        return Boolean(session && !session.closing && session.queue.size() >= MAX_QUEUE_SIZE);
     }
 
     public enqueue(guildId: string, track: TrackMetadata, channel: TextChannel | null): EnqueueResult {
@@ -330,6 +343,7 @@ export class GuildAudioSessionManager {
             this.sessions.delete(session.guildId);
         }
         this.clearInactivityTimer(session);
+        this.clearTrackWatchdog(session);
 
         session.player.removeAllListeners();
         session.player.stop(true);
@@ -348,6 +362,7 @@ export class GuildAudioSessionManager {
     private async startNext(session: GuildAudioSession): Promise<void> {
         if (session.closing || session.current) return;
         this.clearInactivityTimer(session);
+        this.clearTrackWatchdog(session);
 
         while (!session.closing) {
             const track = session.queue.popFront();
@@ -360,6 +375,7 @@ export class GuildAudioSessionManager {
                 const resource = this.takePreload(session, track) ?? this.resources.createTrackResource(track);
                 session.current = resource;
                 session.player.play(resource);
+                this.startTrackWatchdog(session, resource);
                 this.notify(
                     session,
                     `🎶 **Now Playing:** ${escapeMarkdown(resource.metadata.title)}\n🔗 ${resource.metadata.kind === 'track' ? resource.metadata.url : ''}`
@@ -422,6 +438,7 @@ export class GuildAudioSessionManager {
     private startElevatorMusic(session: GuildAudioSession): void {
         if (session.closing || session.current) return;
 
+        this.clearTrackWatchdog(session);
         this.resources.release(session.preload);
         session.preload = undefined;
 
@@ -435,12 +452,11 @@ export class GuildAudioSessionManager {
 
         if (!session.inactivityTimer) {
             this.notify(session, '**Queue finished.** Disconnecting in 5 minutes...');
-            session.inactivityTimer = setTimeout(() => {
-                session.inactivityTimer = undefined;
-                if (this.sessions.get(session.guildId) !== session) return;
-                this.notify(session, '**Disconnected due to 5 minutes of inactivity.**');
-                this.disconnect(session.guildId);
-            }, this.inactivityTimeoutMs);
+            this.scheduleInactivityDisconnect(
+                session,
+                this.inactivityTimeoutMs,
+                '**Disconnected due to 5 minutes of inactivity.**'
+            );
         }
     }
 
@@ -448,6 +464,93 @@ export class GuildAudioSessionManager {
         if (!session.inactivityTimer) return;
         clearTimeout(session.inactivityTimer);
         session.inactivityTimer = undefined;
+    }
+
+    private scheduleInactivityDisconnect(
+        session: GuildAudioSession,
+        timeoutMs: number,
+        disconnectMessage?: string
+    ): void {
+        if (session.inactivityTimer) return;
+
+        session.inactivityTimer = setTimeout(() => {
+            session.inactivityTimer = undefined;
+            if (this.sessions.get(session.guildId) !== session) return;
+            if (disconnectMessage) this.notify(session, disconnectMessage);
+            this.disconnect(session.guildId);
+        }, timeoutMs);
+        session.inactivityTimer.unref();
+    }
+
+    private startTrackWatchdog(session: GuildAudioSession, resource: BeanAudioResource): void {
+        if (resource.metadata.kind !== 'track') return;
+
+        this.clearTrackWatchdog(session);
+
+        const startedAt = Date.now();
+        const maximumPlaybackMs = resource.metadata.duration === undefined
+            ? undefined
+            : Math.max(60_000, Math.ceil(resource.metadata.duration * 1_500) + 30_000);
+        let playbackStartedAt: number | undefined;
+        let lastPlaybackDuration = 0;
+        let lastProgressAt = startedAt;
+
+        const watchdog = setInterval(() => {
+            if (session.closing || session.current !== resource) {
+                this.clearTrackWatchdog(session, watchdog);
+                return;
+            }
+
+            const now = Date.now();
+            if (session.player.state.status !== AudioPlayerStatus.Playing) {
+                if (!playbackStartedAt && now - startedAt >= this.trackStartupTimeoutMs) {
+                    this.stopWatchedTrack(session, resource, '⚠️ Audio did not start in time. Skipping...');
+                } else if (playbackStartedAt && now - lastProgressAt >= this.trackStallTimeoutMs) {
+                    this.stopWatchedTrack(session, resource, '⚠️ Audio playback stalled. Skipping...');
+                }
+                return;
+            }
+
+            if (!playbackStartedAt) playbackStartedAt = now;
+            if (resource.playbackDuration > lastPlaybackDuration) {
+                lastPlaybackDuration = resource.playbackDuration;
+                lastProgressAt = now;
+            } else if (now - lastProgressAt >= this.trackStallTimeoutMs) {
+                this.stopWatchedTrack(session, resource, '⚠️ Audio playback stalled. Skipping...');
+                return;
+            }
+
+            if (maximumPlaybackMs !== undefined && now - playbackStartedAt >= maximumPlaybackMs) {
+                this.stopWatchedTrack(session, resource, '⚠️ Audio exceeded its expected playback time. Skipping...');
+            }
+        }, this.trackWatchdogIntervalMs);
+        watchdog.unref();
+        session.trackWatchdog = watchdog;
+    }
+
+    private stopWatchedTrack(
+        session: GuildAudioSession,
+        resource: BeanAudioResource,
+        message: string
+    ): void {
+        if (session.closing || session.current !== resource) return;
+
+        this.clearTrackWatchdog(session);
+        this.notify(session, message);
+        if (session.player.stop(true)) return;
+
+        void this.schedule(session, async () => {
+            if (session.current !== resource) return;
+            this.resources.release(resource);
+            session.current = undefined;
+            await this.startNext(session);
+        });
+    }
+
+    private clearTrackWatchdog(session: GuildAudioSession, expected?: NodeJS.Timeout): void {
+        if (!session.trackWatchdog || (expected && session.trackWatchdog !== expected)) return;
+        clearInterval(session.trackWatchdog);
+        session.trackWatchdog = undefined;
     }
 
     private notify(session: GuildAudioSession, message: string): void {
