@@ -9,7 +9,10 @@ export default {
         if (!await guildAudioSessionManager.canControlFromInteraction(interaction)) return;
 
         if (!guildAudioSessionManager.skip(interaction.guildId!)) {
-            return interaction.reply({ content: "No audio track is currently playing.", ephemeral: true });
+            return interaction.reply({ 
+                content: "No audio track is currently playing.",
+                flags: MessageFlags.Ephemeral 
+            });
         }
         await interaction.reply("Skipped the current track.");
     }
