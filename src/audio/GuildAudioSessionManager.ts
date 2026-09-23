@@ -45,9 +45,17 @@ const VOICE_CLOSE_CODE_DESCRIPTIONS: Readonly<Record<number, string>> = {
 
 const TERMINAL_VOICE_CLOSE_CODES = new Set([4021, 4022]);
 
+export class VoiceConnectionRateLimitError extends Error {
+    public constructor(public readonly retryAfterMs: number) {
+        super('Discord voice connections are temporarily rate limited.');
+        this.name = 'VoiceConnectionRateLimitError';
+    }
+}
+
 export class GuildAudioSessionManager {
     private readonly sessions = new Map<string, GuildAudioSession>();
     private readonly observedNetworkingInstances = new WeakSet<object>();
+    private readonly rateLimitCooldowns = new Map<string, number>();
 
     public constructor(
         private readonly resources: AudioResourceManager = audioResourceManager,
@@ -58,7 +66,8 @@ export class GuildAudioSessionManager {
         private readonly trackStartupTimeoutMs = 20_000,
         private readonly trackStallTimeoutMs = 30_000,
         private readonly trackWatchdogIntervalMs = 5_000,
-        private readonly externalDisconnectGraceTimeoutMs = 5_000
+        private readonly externalDisconnectGraceTimeoutMs = 5_000,
+        private readonly rateLimitCooldownMs = 60_000
     ) {}
 
     public async connect(
@@ -66,6 +75,11 @@ export class GuildAudioSessionManager {
         channelId: string,
         adapterCreator: DiscordGatewayAdapterCreator
     ): Promise<VoiceConnection> {
+        const cooldownRemainingMs = this.getRateLimitCooldownRemaining(guildId);
+        if (cooldownRemainingMs > 0) {
+            throw new VoiceConnectionRateLimitError(cooldownRemainingMs);
+        }
+
         const existing = this.sessions.get(guildId);
         if (existing && !existing.closing) {
             this.syncSessionChannel(existing);
@@ -73,7 +87,9 @@ export class GuildAudioSessionManager {
                 throw new Error(`Audio is already active in voice channel ${existing.channelId}.`);
             }
             try {
-                return await this.awaitReady(existing);
+                const readyConnection = await this.awaitReady(existing);
+                existing.hasBeenReady = true;
+                return readyConnection;
             } catch (error) {
                 this.closeSession(existing, true);
                 throw error;
@@ -96,7 +112,7 @@ export class GuildAudioSessionManager {
             queue: new Deque<QueuedTrack>(),
             announcementChannel: null,
             transition: Promise.resolve(),
-            hasBeenReady: false,
+            hasBeenReady: connection.state.status === VoiceConnectionStatus.Ready,
             closing: false
         };
 
@@ -172,8 +188,17 @@ export class GuildAudioSessionManager {
         connection.subscribe(player);
         this.sessions.set(guildId, session);
 
+        const initialConnectionState = connection.state;
+        if (
+            initialConnectionState.status === VoiceConnectionStatus.Connecting ||
+            initialConnectionState.status === VoiceConnectionStatus.Ready
+        ) {
+            this.observeNetworkingClose(session, initialConnectionState.networking);
+        }
+
         try {
             const readyConnection = await this.awaitReady(session);
+            session.hasBeenReady = true;
             this.scheduleInactivityDisconnect(session, this.emptySessionTimeoutMs);
             return readyConnection;
         } catch (error) {
@@ -372,12 +397,37 @@ export class GuildAudioSessionManager {
 
             if (!TERMINAL_VOICE_CLOSE_CODES.has(code)) return;
 
+            if (code === 4021) this.startRateLimitCooldown(session.guildId);
+
             const notification = code === 4021
                 ? '⚠️ Discord disconnected the bot for voice rate limiting. The audio session has been cleared.'
                 : 'ℹ️ The voice call ended or became unavailable. The audio session has been cleared.';
             this.notify(session, notification);
             this.closeSession(session, true);
         });
+    }
+
+    private getRateLimitCooldownRemaining(guildId: string): number {
+        const expiresAt = this.rateLimitCooldowns.get(guildId);
+        if (expiresAt === undefined) return 0;
+
+        const remainingMs = expiresAt - Date.now();
+        if (remainingMs > 0) return remainingMs;
+
+        this.rateLimitCooldowns.delete(guildId);
+        return 0;
+    }
+
+    private startRateLimitCooldown(guildId: string): void {
+        const expiresAt = Date.now() + this.rateLimitCooldownMs;
+        this.rateLimitCooldowns.set(guildId, expiresAt);
+
+        const cleanupTimer = setTimeout(() => {
+            if (this.rateLimitCooldowns.get(guildId) === expiresAt) {
+                this.rateLimitCooldowns.delete(guildId);
+            }
+        }, this.rateLimitCooldownMs);
+        cleanupTimer.unref();
     }
 
     private syncSessionChannel(session: GuildAudioSession): void {

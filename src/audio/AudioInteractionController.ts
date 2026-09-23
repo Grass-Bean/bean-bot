@@ -6,6 +6,7 @@ import {
 import { VoiceConnection } from '@discordjs/voice';
 import {
     GuildAudioSessionManager,
+    VoiceConnectionRateLimitError,
     guildAudioSessionManager
 } from './GuildAudioSessionManager.js';
 
@@ -74,6 +75,15 @@ export class AudioInteractionController {
                 interaction.guild.voiceAdapterCreator
             );
         } catch (error) {
+            if (error instanceof VoiceConnectionRateLimitError) {
+                const retryAfterSeconds = Math.max(1, Math.ceil(error.retryAfterMs / 1_000));
+                await this.respond(
+                    interaction,
+                    `Discord temporarily rate-limited voice connections. Please try again in ${retryAfterSeconds} seconds.`
+                );
+                return undefined;
+            }
+
             console.error(`Failed to connect to voice in guild ${interaction.guild.id}:`, error);
             await this.respond(interaction, 'Failed to connect to the voice channel.');
             return undefined;
