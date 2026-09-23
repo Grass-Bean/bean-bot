@@ -1,4 +1,5 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, escapeMarkdown, TextChannel } from 'discord.js';
+import { audioInteractionController } from '../../audio/AudioInteractionController.js';
 import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
 import { TrackResolverError, trackResolver } from '../../audio/TrackResolver.js';
 
@@ -28,7 +29,7 @@ export default {
         
     async execute(interaction: ChatInputCommandInteraction) {
         const guildId = interaction.guildId!;
-        const voiceChannelId = await guildAudioSessionManager.validateInteractionVoiceChannel(interaction);
+        const voiceChannelId = await audioInteractionController.requireVoiceChannel(interaction);
         if (!voiceChannelId) return;
 
         const query = interaction.options.getString('query', true);
@@ -47,7 +48,7 @@ export default {
 
         try {
             const track = await trackResolver.resolve(query, interaction.user.id);
-            const conn = await guildAudioSessionManager.connectForInteraction(interaction, voiceChannelId);
+            const conn = await audioInteractionController.connect(interaction, voiceChannelId);
             if (!conn) return;
 
             const result = guildAudioSessionManager.enqueue(

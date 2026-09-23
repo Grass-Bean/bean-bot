@@ -1,4 +1,5 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, MessageFlags } from 'discord.js';
+import { audioInteractionController } from '../../audio/AudioInteractionController.js';
 import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
 
 export default {
@@ -18,7 +19,7 @@ export default {
 
         // 2. disconnect
         try {
-            if (!await guildAudioSessionManager.canControlFromInteraction(interaction)) return;
+            if (!await audioInteractionController.ensureCanControl(interaction)) return;
 
             if (guildAudioSessionManager.disconnect(interaction.guild.id)) {
                 await interaction.reply({ 

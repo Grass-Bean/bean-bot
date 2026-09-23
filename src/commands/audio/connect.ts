@@ -1,5 +1,5 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, MessageFlags} from 'discord.js';
-import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
+import { audioInteractionController } from '../../audio/AudioInteractionController.js';
 
 export default {
     data: new SlashCommandBuilder()
@@ -7,11 +7,11 @@ export default {
         .setDescription('Connects the bot to your current voice channel'),
         
     async execute(interaction: ChatInputCommandInteraction) {
-        const voiceChannelId = await guildAudioSessionManager.validateInteractionVoiceChannel(interaction);
+        const voiceChannelId = await audioInteractionController.requireVoiceChannel(interaction);
         if (!voiceChannelId) return;
 
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-        const connection = await guildAudioSessionManager.connectForInteraction(interaction, voiceChannelId);
+        const connection = await audioInteractionController.connect(interaction, voiceChannelId);
         if (connection) {
             await interaction.editReply({
                 content: 'Connected to voice channel! 🔊',

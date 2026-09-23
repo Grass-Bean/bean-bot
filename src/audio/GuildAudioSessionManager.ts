@@ -6,9 +6,10 @@ import {
     entersState,
     joinVoiceChannel,
     VoiceConnection,
+    VoiceConnectionDisconnectReason,
     VoiceConnectionStatus
 } from '@discordjs/voice';
-import { ChatInputCommandInteraction, escapeMarkdown, GuildMember, MessageFlags, TextChannel } from 'discord.js';
+import { escapeMarkdown, TextChannel } from 'discord.js';
 import { Deque, MAX_QUEUE_SIZE } from './Deque.js';
 import { audioResourceManager, AudioResourceManager } from './AudioResourceManager.js';
 import {
@@ -31,7 +32,7 @@ interface GuildAudioSession {
     trackWatchdog?: NodeJS.Timeout;
     announcementChannel: TextChannel | null;
     transition: Promise<void>;
-    recovery?: Promise<void>;
+    recovery?: VoiceRecovery;
     hasBeenReady: boolean;
     closing: boolean;
 }
@@ -41,8 +42,38 @@ interface QueuedTrack {
     announcementChannel: TextChannel | null;
 }
 
+type VoiceRecoveryKind = 'transient' | 'external-disconnect';
+
+interface VoiceRecovery {
+    kind: VoiceRecoveryKind;
+    controller: AbortController;
+    promise: Promise<void>;
+}
+
+const VOICE_CLOSE_CODE_DESCRIPTIONS: Readonly<Record<number, string>> = {
+    4001: 'Unknown opcode',
+    4002: 'Failed to decode payload',
+    4003: 'Not authenticated',
+    4004: 'Authentication failed',
+    4005: 'Already authenticated',
+    4006: 'Session no longer valid',
+    4009: 'Session timeout',
+    4011: 'Server not found',
+    4012: 'Unknown protocol',
+    4014: 'Disconnected',
+    4015: 'Voice server crashed',
+    4016: 'Unknown encryption mode',
+    4017: 'E2EE/DAVE protocol required',
+    4020: 'Bad request',
+    4021: 'Disconnected: Rate limited',
+    4022: 'Disconnected: Call terminated'
+};
+
+const TERMINAL_VOICE_CLOSE_CODES = new Set([4021, 4022]);
+
 export class GuildAudioSessionManager {
     private readonly sessions = new Map<string, GuildAudioSession>();
+    private readonly observedNetworkingInstances = new WeakSet<object>();
 
     public constructor(
         private readonly resources: AudioResourceManager = audioResourceManager,
@@ -52,7 +83,8 @@ export class GuildAudioSessionManager {
         private readonly emptySessionTimeoutMs = 10 * 60 * 1000,
         private readonly trackStartupTimeoutMs = 20_000,
         private readonly trackStallTimeoutMs = 30_000,
-        private readonly trackWatchdogIntervalMs = 5_000
+        private readonly trackWatchdogIntervalMs = 5_000,
+        private readonly externalDisconnectGraceTimeoutMs = 5_000
     ) {}
 
     public async connect(
@@ -121,16 +153,45 @@ export class GuildAudioSessionManager {
         connection.on('stateChange', (_oldState, newState) => {
             this.syncSessionChannel(session);
 
+            if (newState.status === VoiceConnectionStatus.Connecting) {
+                this.observeNetworkingClose(session, newState.networking);
+            }
+
             if (newState.status === VoiceConnectionStatus.Destroyed) {
                 this.closeSession(session, false);
                 return;
             }
             if (newState.status === VoiceConnectionStatus.Ready) {
                 session.hasBeenReady = true;
+                this.cancelRecovery(session);
                 return;
             }
             if (session.hasBeenReady) {
-                void this.recoverConnection(session);
+                let recoveryKind: VoiceRecoveryKind = 'transient';
+
+                if (newState.status === VoiceConnectionStatus.Disconnected) {
+                    const closeCode = newState.reason === VoiceConnectionDisconnectReason.WebSocketClose
+                        ? newState.closeCode
+                        : undefined;
+                    const reason = VoiceConnectionDisconnectReason[newState.reason];
+                    console.info(
+                        `Voice connection disconnected in guild ${guildId} ` +
+                        `(reason=${reason}${closeCode === undefined ? '' : `, closeCode=${closeCode}`}).`
+                    );
+
+                    if (
+                        newState.reason === VoiceConnectionDisconnectReason.Manual ||
+                        newState.reason === VoiceConnectionDisconnectReason.EndpointRemoved ||
+                        (
+                            newState.reason === VoiceConnectionDisconnectReason.WebSocketClose &&
+                            newState.closeCode === 4014
+                        )
+                    ) {
+                        recoveryKind = 'external-disconnect';
+                    }
+                }
+
+                void this.recoverConnection(session, recoveryKind);
             }
         });
 
@@ -147,73 +208,12 @@ export class GuildAudioSessionManager {
         }
     }
 
-    public async validateInteractionVoiceChannel(
-        interaction: ChatInputCommandInteraction,
-        expectedChannelId?: string
-    ): Promise<string | undefined> {
-        if (!interaction.guild || !interaction.member) {
-            await this.respondToInteraction(interaction, 'This command can only be used in a server.');
-            return undefined;
-        }
+    public getActiveChannelId(guildId: string): string | undefined {
+        const session = this.sessions.get(guildId);
+        if (!session || session.closing) return undefined;
 
-        let member: GuildMember;
-        try {
-            member = interaction.member instanceof GuildMember
-                ? interaction.member
-                : await interaction.guild.members.fetch(interaction.user.id);
-        } catch (error) {
-            console.error(`Failed to resolve member voice state in guild ${interaction.guild.id}:`, error);
-            await this.respondToInteraction(interaction, 'Could not determine your voice channel.');
-            return undefined;
-        }
-
-        const voiceChannelId = member.voice.channelId;
-        if (!voiceChannelId) {
-            await this.respondToInteraction(interaction, 'You need to be in a voice channel to use this command.');
-            return undefined;
-        }
-
-        if (expectedChannelId && expectedChannelId !== voiceChannelId) {
-            await this.respondToInteraction(interaction, 'Your voice channel changed while the command was running. Please try again.');
-            return undefined;
-        }
-
-        const existing = this.sessions.get(interaction.guild.id);
-        if (existing && !existing.closing) this.syncSessionChannel(existing);
-        if (existing && !existing.closing && existing.channelId !== voiceChannelId) {
-            await this.respondToInteraction(
-                interaction,
-                `The bot is already active in <#${existing.channelId}>. Join that voice channel to control it.`
-            );
-            return undefined;
-        }
-
-        return voiceChannelId;
-    }
-
-    public async connectForInteraction(
-        interaction: ChatInputCommandInteraction,
-        expectedChannelId?: string
-    ): Promise<VoiceConnection | undefined> {
-        const voiceChannelId = await this.validateInteractionVoiceChannel(interaction, expectedChannelId);
-        if (!voiceChannelId || !interaction.guild) return undefined;
-
-        try {
-            return await this.connect(
-                interaction.guild.id,
-                voiceChannelId,
-                interaction.guild.voiceAdapterCreator
-            );
-        } catch (error) {
-            console.error(`Failed to connect to voice in guild ${interaction.guild.id}:`, error);
-            await this.respondToInteraction(interaction, 'Failed to connect to the voice channel.');
-            return undefined;
-        }
-    }
-
-    public async canControlFromInteraction(interaction: ChatInputCommandInteraction): Promise<boolean> {
-        if (!interaction.guildId || !this.sessions.has(interaction.guildId)) return true;
-        return (await this.validateInteractionVoiceChannel(interaction)) !== undefined;
+        this.syncSessionChannel(session);
+        return session.channelId;
     }
 
     public isQueueFull(guildId: string): boolean {
@@ -301,7 +301,7 @@ export class GuildAudioSessionManager {
 
     private async awaitReady(
         session: GuildAudioSession,
-        timeoutMs = this.connectionReadyTimeoutMs
+        timeoutOrSignal: number | AbortSignal = this.connectionReadyTimeoutMs
     ): Promise<VoiceConnection> {
         if (session.connection.state.status === VoiceConnectionStatus.Ready) {
             return session.connection;
@@ -310,33 +310,111 @@ export class GuildAudioSessionManager {
         return entersState(
             session.connection,
             VoiceConnectionStatus.Ready,
-            timeoutMs
+            timeoutOrSignal
         );
     }
 
-    private async recoverConnection(session: GuildAudioSession): Promise<void> {
-        if (session.closing || session.recovery) return session.recovery;
+    private async recoverConnection(
+        session: GuildAudioSession,
+        recoveryKind: VoiceRecoveryKind = 'transient'
+    ): Promise<void> {
+        if (session.closing) return;
 
-        session.recovery = (async () => {
+        const existingRecovery = session.recovery;
+        if (existingRecovery?.kind === recoveryKind) return existingRecovery.promise;
+
+        existingRecovery?.controller.abort();
+
+        const controller = new AbortController();
+        const recovery: VoiceRecovery = {
+            kind: recoveryKind,
+            controller,
+            promise: Promise.resolve()
+        };
+        session.recovery = recovery;
+
+        recovery.promise = (async () => {
             try {
-                await this.awaitReady(session, this.connectionRecoveryTimeoutMs);
+                const timeoutMs = recoveryKind === 'external-disconnect'
+                    ? this.externalDisconnectGraceTimeoutMs
+                    : this.connectionRecoveryTimeoutMs;
+                const timeout = setTimeout(() => controller.abort(), timeoutMs);
+                timeout.unref();
+
+                try {
+                    await this.awaitReady(session, controller.signal);
+                } finally {
+                    clearTimeout(timeout);
+                }
                 this.syncSessionChannel(session);
             } catch (error) {
-                if (this.sessions.get(session.guildId) !== session || session.closing) return;
-                console.error(`Voice connection recovery failed in guild ${session.guildId}:`, error);
-                this.notify(session, '⚠️ Voice connection was lost. Disconnecting the audio session.');
+                if (
+                    session.recovery !== recovery ||
+                    this.sessions.get(session.guildId) !== session ||
+                    session.closing
+                ) return;
+
+                if (recoveryKind === 'external-disconnect') {
+                    console.info(
+                        `Voice connection in guild ${session.guildId} was removed externally; ` +
+                        'clearing the audio session.'
+                    );
+                    this.notify(
+                        session,
+                        'ℹ️ The bot was disconnected from the voice channel. The audio session has been cleared.'
+                    );
+                } else {
+                    console.error(`Voice connection recovery failed in guild ${session.guildId}:`, error);
+                    this.notify(session, '⚠️ Voice connection was lost. Disconnecting the audio session.');
+                }
                 this.closeSession(session, true);
             } finally {
-                session.recovery = undefined;
+                if (session.recovery === recovery) session.recovery = undefined;
             }
         })();
 
-        return session.recovery;
+        return recovery.promise;
+    }
+
+    private observeNetworkingClose(
+        session: GuildAudioSession,
+        networking: object & {
+            prependOnceListener(event: 'close', listener: (code: number) => void): unknown;
+        }
+    ): void {
+        if (this.observedNetworkingInstances.has(networking)) return;
+        this.observedNetworkingInstances.add(networking);
+
+        // Run before @discordjs/voice's close listener so terminal close codes do
+        // not trigger the library's generic rejoin path.
+        networking.prependOnceListener('close', (code) => {
+            if (this.sessions.get(session.guildId) !== session || session.closing) return;
+
+            const description = VOICE_CLOSE_CODE_DESCRIPTIONS[code] ?? 'Unknown voice close code';
+            console.info(
+                `Voice WebSocket closed in guild ${session.guildId} ` +
+                `(closeCode=${code}, description=${description}).`
+            );
+
+            if (!TERMINAL_VOICE_CLOSE_CODES.has(code)) return;
+
+            const notification = code === 4021
+                ? '⚠️ Discord disconnected the bot for voice rate limiting. The audio session has been cleared.'
+                : 'ℹ️ The voice call ended or became unavailable. The audio session has been cleared.';
+            this.notify(session, notification);
+            this.closeSession(session, true);
+        });
     }
 
     private syncSessionChannel(session: GuildAudioSession): void {
         const channelId = session.connection.joinConfig.channelId;
         if (channelId) session.channelId = channelId;
+    }
+
+    private cancelRecovery(session: GuildAudioSession): void {
+        const recovery = session.recovery;
+        session.recovery = undefined;
+        recovery?.controller.abort();
     }
 
     private closeSession(session: GuildAudioSession, destroyConnection: boolean): boolean {
@@ -348,6 +426,7 @@ export class GuildAudioSessionManager {
         }
         this.clearInactivityTimer(session);
         this.clearTrackWatchdog(session);
+        this.cancelRecovery(session);
 
         session.player.removeAllListeners();
         session.player.stop(true);
@@ -571,23 +650,6 @@ export class GuildAudioSessionManager {
         });
     }
 
-    private async respondToInteraction(
-        interaction: ChatInputCommandInteraction,
-        content: string
-    ): Promise<void> {
-        const response = {
-            content,
-            allowedMentions: { parse: [] }
-        };
-
-        if (interaction.deferred) {
-            await interaction.editReply(response);
-        } else if (interaction.replied) {
-            await interaction.followUp({ ...response, flags: MessageFlags.Ephemeral });
-        } else {
-            await interaction.reply({ ...response, flags: MessageFlags.Ephemeral });
-        }
-    }
 }
 
 export const guildAudioSessionManager = new GuildAudioSessionManager();

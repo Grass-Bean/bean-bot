@@ -1,4 +1,5 @@
 import { SlashCommandBuilder, ChatInputCommandInteraction, MessageFlags } from 'discord.js';
+import { audioInteractionController } from '../../audio/AudioInteractionController.js';
 import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
 
 export default {
@@ -6,7 +7,7 @@ export default {
         .setName('skip')
         .setDescription('Skips the currently playing audio track'),
     async execute(interaction: ChatInputCommandInteraction) {
-        if (!await guildAudioSessionManager.canControlFromInteraction(interaction)) return;
+        if (!await audioInteractionController.ensureCanControl(interaction)) return;
 
         if (!guildAudioSessionManager.skip(interaction.guildId!)) {
             return interaction.reply({ 
