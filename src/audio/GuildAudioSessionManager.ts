@@ -12,43 +12,17 @@ import {
 import { escapeMarkdown, TextChannel } from 'discord.js';
 import { Deque, MAX_QUEUE_SIZE } from './Deque.js';
 import { audioResourceManager, AudioResourceManager } from './AudioResourceManager.js';
-import {
+import type {
     AudioMetadata,
     AudioQueueSnapshot,
     BeanAudioResource,
     EnqueueResult,
-    TrackMetadata
+    GuildAudioSession,
+    QueuedTrack,
+    TrackMetadata,
+    VoiceRecovery,
+    VoiceRecoveryKind
 } from './types.js';
-
-interface GuildAudioSession {
-    guildId: string;
-    channelId: string;
-    connection: VoiceConnection;
-    player: AudioPlayer;
-    queue: Deque<QueuedTrack>;
-    current?: BeanAudioResource;
-    preload?: BeanAudioResource;
-    inactivityTimer?: NodeJS.Timeout;
-    trackWatchdog?: NodeJS.Timeout;
-    announcementChannel: TextChannel | null;
-    transition: Promise<void>;
-    recovery?: VoiceRecovery;
-    hasBeenReady: boolean;
-    closing: boolean;
-}
-
-interface QueuedTrack {
-    track: TrackMetadata;
-    announcementChannel: TextChannel | null;
-}
-
-type VoiceRecoveryKind = 'transient' | 'external-disconnect';
-
-interface VoiceRecovery {
-    kind: VoiceRecoveryKind;
-    controller: AbortController;
-    promise: Promise<void>;
-}
 
 const VOICE_CLOSE_CODE_DESCRIPTIONS: Readonly<Record<number, string>> = {
     4001: 'Unknown opcode',

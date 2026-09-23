@@ -1,13 +1,13 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { randomUUID } from 'crypto';
-import type { TrackMetadata } from './types.js';
+import type {
+    TrackMetadata,
+    TrackResolverErrorCode,
+    TrackResolverOptions,
+    YtDlpMetadata
+} from './types.js';
 
-interface YtDlpMetadata {
-    title: string;
-    webpage_url: string;
-    duration?: number | null;
-    thumbnail?: string | null;
-}
+export type { TrackResolverErrorCode, TrackResolverOptions } from './types.js';
 
 const MAX_STDERR_BYTES = 8_000;
 const MAX_TIMER_MS = 2_147_483_647;
@@ -16,15 +16,6 @@ const MAX_TRACK_TITLE_CHARACTERS = 200;
 const MAX_TRACK_URL_CHARACTERS = 1_000;
 const ALLOWED_MEDIA_HOSTS = ['youtube.com', 'youtube-nocookie.com', 'instagram.com'];
 const ALLOWED_SHORT_LINK_HOSTS = new Set(['youtu.be', 'instagr.am']);
-
-export type TrackResolverErrorCode =
-    | 'INVALID_INPUT'
-    | 'UNSUPPORTED_URL'
-    | 'TIMEOUT'
-    | 'CANCELLED'
-    | 'PROCESS_FAILURE'
-    | 'OUTPUT_LIMIT'
-    | 'INVALID_RESPONSE';
 
 export class TrackResolverError extends Error {
     public constructor(
@@ -35,15 +26,6 @@ export class TrackResolverError extends Error {
         super(message, options);
         this.name = 'TrackResolverError';
     }
-}
-
-export interface TrackResolverOptions {
-    timeoutMs?: number;
-    maxStdoutBytes?: number;
-    forceKillTimeoutMs?: number;
-    ytDlpCommand?: string;
-    ytDlpCommandArgs?: readonly string[];
-    logDiagnostics?: boolean;
 }
 
 const isYtDlpMetadata = (value: unknown): value is YtDlpMetadata => {
