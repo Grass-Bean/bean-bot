@@ -1,32 +1,25 @@
-import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { spawnMock, createAudioResourceMock } = vi.hoisted(() => ({
-    spawnMock: vi.fn(),
+const { createAudioResourceMock } = vi.hoisted(() => ({
     createAudioResourceMock: vi.fn()
 }));
 
-vi.mock('child_process', () => ({ spawn: spawnMock }));
 vi.mock('@discordjs/voice', async (importOriginal) => {
     const actual = await importOriginal<typeof import('@discordjs/voice')>();
-    return {
-        ...actual,
-        createAudioResource: createAudioResourceMock
-    };
+    return { ...actual, createAudioResource: createAudioResourceMock };
 });
 
 import { StreamType } from '@discordjs/voice';
 import { AudioResourceManager } from '../src/audio/AudioResourceManager.js';
-import type { BeanAudioResource, TrackMetadata } from '../src/audio/types.js';
-
-type FakeProcess = EventEmitter & {
-    stdout: PassThrough;
-    stderr: PassThrough;
-    exitCode: number | null;
-    signalCode: NodeJS.Signals | null;
-    kill: ReturnType<typeof vi.fn>;
-};
+import { YtDlpProcessError } from '../src/audio/YtDlpProcessManager.js';
+import type {
+    BeanAudioResource,
+    TrackMetadata,
+    YtDlpProcessClient,
+    YtDlpProcessOutcome,
+    YtDlpStreamHandle
+} from '../src/audio/types.js';
 
 const track: TrackMetadata = {
     kind: 'track',
@@ -37,51 +30,51 @@ const track: TrackMetadata = {
     requestedBy: 'user-a'
 };
 
-const createProcess = (): FakeProcess => {
-    const child = new EventEmitter() as FakeProcess;
-    child.stdout = new PassThrough();
-    child.stderr = new PassThrough();
-    child.exitCode = null;
-    child.signalCode = null;
-    child.kill = vi.fn().mockReturnValue(true);
-    return child;
-};
-
 const createResource = (metadata = track) => {
     const playStream = new PassThrough();
-    const resource = {
+    return {
         metadata,
         playStream,
         playbackDuration: 0,
         volume: { setVolume: vi.fn() }
     } as unknown as BeanAudioResource;
-    return resource;
 };
+
+const createHandle = () => {
+    let complete!: (outcome: YtDlpProcessOutcome) => void;
+    const completion = new Promise<YtDlpProcessOutcome>(resolve => {
+        complete = resolve;
+    });
+    const handle: YtDlpStreamHandle = {
+        stdout: new PassThrough(),
+        completion,
+        stop: vi.fn().mockResolvedValue(undefined)
+    };
+    return { handle, complete };
+};
+
+const createProcesses = (handle: YtDlpStreamHandle) => ({
+    collect: vi.fn(),
+    stream: vi.fn().mockReturnValue(handle)
+}) as unknown as YtDlpProcessClient;
 
 describe('AudioResourceManager', () => {
     beforeEach(() => {
-        spawnMock.mockReset();
         createAudioResourceMock.mockReset();
     });
 
-    afterEach(() => {
-        vi.useRealTimers();
-    });
-
-    it('spawns yt-dlp with an argument boundary and registers a track resource', () => {
-        const child = createProcess();
+    it('builds streaming arguments and registers the returned resource', () => {
+        const { handle } = createHandle();
+        const processes = createProcesses(handle);
         const resource = createResource();
-        spawnMock.mockReturnValue(child);
         createAudioResourceMock.mockReturnValue(resource);
-        const manager = new AudioResourceManager(100, 'yt-custom');
+        const manager = new AudioResourceManager({ processes });
 
         expect(manager.createTrackResource(track)).toBe(resource);
-        expect(spawnMock).toHaveBeenCalledWith(
-            'yt-custom',
-            expect.arrayContaining(['--', track.url]),
-            { windowsHide: true }
-        );
-        expect(createAudioResourceMock).toHaveBeenCalledWith(child.stdout, {
+        expect(processes.stream).toHaveBeenCalledWith(expect.arrayContaining([
+            '--ignore-config', '--no-playlist', '--', track.url
+        ]));
+        expect(createAudioResourceMock).toHaveBeenCalledWith(handle.stdout, {
             inputType: StreamType.Arbitrary,
             inlineVolume: true,
             metadata: track
@@ -89,13 +82,11 @@ describe('AudioResourceManager', () => {
         expect(manager.isReleased(resource)).toBe(false);
     });
 
-    it('releases a track exactly once and force-kills a process that does not exit', async () => {
-        vi.useFakeTimers();
-        const child = createProcess();
+    it('releases a track and its source exactly once', () => {
+        const { handle } = createHandle();
         const resource = createResource();
-        spawnMock.mockReturnValue(child);
         createAudioResourceMock.mockReturnValue(resource);
-        const manager = new AudioResourceManager(10);
+        const manager = new AudioResourceManager({ processes: createProcesses(handle) });
         manager.createTrackResource(track);
 
         manager.release(resource);
@@ -103,166 +94,93 @@ describe('AudioResourceManager', () => {
 
         expect(manager.isReleased(resource)).toBe(true);
         expect(resource.playStream.destroyed).toBe(true);
-        expect(child.kill).toHaveBeenCalledTimes(1);
-        expect(child.kill).toHaveBeenCalledWith('SIGTERM');
-
-        await vi.advanceTimersByTimeAsync(10);
-        expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+        expect(handle.stop).toHaveBeenCalledOnce();
     });
 
-    it('treats the play stream closing as a release and tears down the source once', () => {
-        const child = createProcess();
+    it('treats play-stream closure as release', () => {
+        const { handle } = createHandle();
         const resource = createResource();
-        const unpipeSpy = vi.spyOn(child.stdout, 'unpipe');
-        const resumeSpy = vi.spyOn(child.stdout, 'resume');
-        spawnMock.mockReturnValue(child);
         createAudioResourceMock.mockReturnValue(resource);
-        const manager = new AudioResourceManager(100);
+        const manager = new AudioResourceManager({ processes: createProcesses(handle) });
         manager.createTrackResource(track);
 
         resource.playStream.emit('close');
         resource.playStream.emit('error', new Error('late stream error'));
-        manager.release(resource);
 
         expect(manager.isReleased(resource)).toBe(true);
-        expect(unpipeSpy).toHaveBeenCalledOnce();
-        expect(resumeSpy).toHaveBeenCalledOnce();
-        expect(child.kill).toHaveBeenCalledTimes(1);
-        expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+        expect(handle.stop).toHaveBeenCalledOnce();
     });
 
-    it('cancels the force-kill timer when the child closes after SIGTERM', async () => {
-        vi.useFakeTimers();
-        const child = createProcess();
-        const resource = createResource();
-        spawnMock.mockReturnValue(child);
-        createAudioResourceMock.mockReturnValue(resource);
-        const manager = new AudioResourceManager(10);
-        manager.createTrackResource(track);
-
-        manager.release(resource);
-        child.emit('close', 0, null);
-        await vi.advanceTimersByTimeAsync(10);
-
-        expect(child.kill).toHaveBeenCalledTimes(1);
-        expect(child.kill).not.toHaveBeenCalledWith('SIGKILL');
-    });
-
-    it('does not kill a process that has already exited', () => {
-        const child = createProcess();
-        child.exitCode = 0;
-        const resource = createResource();
-        spawnMock.mockReturnValue(child);
-        createAudioResourceMock.mockReturnValue(resource);
-        const manager = new AudioResourceManager();
-        manager.createTrackResource(track);
-
-        manager.release(resource);
-        expect(child.kill).not.toHaveBeenCalled();
-    });
-
-    it('leaves the resource alive when yt-dlp exits and closes successfully', () => {
-        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-        const child = createProcess();
+    it('leaves buffered playback alive after clean yt-dlp completion', async () => {
+        const { handle, complete } = createHandle();
         const resource = createResource();
         const destroySpy = vi.spyOn(resource.playStream, 'destroy');
-        spawnMock.mockReturnValue(child);
         createAudioResourceMock.mockReturnValue(resource);
-        const manager = new AudioResourceManager();
+        const manager = new AudioResourceManager({ processes: createProcesses(handle) });
         manager.createTrackResource(track);
 
-        child.emit('exit', 0, null);
-        child.emit('close', 0, null);
+        complete({
+            status: 'succeeded',
+            exitCode: 0,
+            signal: null,
+            stderr: Buffer.alloc(0)
+        });
+        await handle.completion;
+        await Promise.resolve();
 
-        expect(errorSpy).not.toHaveBeenCalled();
         expect(destroySpy).not.toHaveBeenCalled();
         expect(manager.isReleased(resource)).toBe(false);
     });
 
-    it('reports a child terminated by a signal when exit arrives before close', () => {
-        vi.spyOn(console, 'error').mockImplementation(() => undefined);
-        const child = createProcess();
-        const resource = createResource();
-        const destroySpy = vi.spyOn(resource.playStream, 'destroy');
-        spawnMock.mockReturnValue(child);
-        createAudioResourceMock.mockReturnValue(resource);
-        new AudioResourceManager().createTrackResource(track);
-
-        child.emit('exit', null, 'SIGABRT');
-
-        expect(destroySpy).toHaveBeenCalledWith(expect.objectContaining({
-            message: expect.stringContaining('terminated by SIGABRT')
-        }));
-    });
-
-    it('turns child-process failures into stream errors with sanitized diagnostics', () => {
+    it('turns manager failures into sanitized playback errors', async () => {
         const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-        const child = createProcess();
+        const { handle, complete } = createHandle();
         const resource = createResource();
         const destroySpy = vi.spyOn(resource.playStream, 'destroy');
-        spawnMock.mockReturnValue(child);
         createAudioResourceMock.mockReturnValue(resource);
-        new AudioResourceManager().createTrackResource(track);
+        new AudioResourceManager({ processes: createProcesses(handle) }).createTrackResource(track);
 
-        child.stderr.emit('data', Buffer.from('private\u0000 detail'));
-        child.emit('error', new Error('spawn\nfailed'));
+        complete({
+            status: 'failed',
+            exitCode: null,
+            signal: null,
+            error: new YtDlpProcessError(
+                'Failed\nto start yt-dlp',
+                'SPAWN_FAILURE',
+                Buffer.from('private\u0000 detail')
+            )
+        });
+        await handle.completion;
+        await Promise.resolve();
 
         expect(destroySpy).toHaveBeenCalledWith(expect.objectContaining({
-            message: 'Failed to start yt-dlp: spawn failed: private  detail'
+            message: 'Failed to start yt-dlp: private  detail'
         }));
         expect(errorSpy).toHaveBeenCalledWith('[yt-dlp] Track  A:', expect.any(String));
-        expect(child.kill).toHaveBeenCalledWith('SIGTERM');
-    });
-
-    it('handles stdout, stderr, exit, and close failures only once', () => {
-        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-        const child = createProcess();
-        const resource = createResource();
-        spawnMock.mockReturnValue(child);
-        createAudioResourceMock.mockReturnValue(resource);
-        new AudioResourceManager().createTrackResource(track);
-
-        child.stdout.emit('error', new Error('stdout broke'));
-        child.stderr.emit('error', new Error('stderr broke'));
-        child.emit('exit', 3, null);
-        child.emit('close', 3, null);
-
-        expect(errorSpy).toHaveBeenCalledTimes(1);
-        expect(resource.playStream.destroyed).toBe(true);
-    });
-
-    it('uses close as the failure fallback when no exit failure was reported', () => {
-        vi.spyOn(console, 'error').mockImplementation(() => undefined);
-        const child = createProcess();
-        const resource = createResource();
-        const destroySpy = vi.spyOn(resource.playStream, 'destroy');
-        spawnMock.mockReturnValue(child);
-        createAudioResourceMock.mockReturnValue(resource);
-        new AudioResourceManager().createTrackResource(track);
-
-        child.emit('close', null, 'SIGABRT');
-        expect(destroySpy).toHaveBeenCalledWith(expect.objectContaining({
-            message: expect.stringContaining('closed after signal SIGABRT')
-        }));
+        expect(handle.stop).not.toHaveBeenCalled();
     });
 
     it('stops the source if audio resource construction throws', () => {
-        const child = createProcess();
-        spawnMock.mockReturnValue(child);
+        const { handle } = createHandle();
         createAudioResourceMock.mockImplementation(() => { throw new Error('bad resource'); });
+        const manager = new AudioResourceManager({ processes: createProcesses(handle) });
 
-        expect(() => new AudioResourceManager().createTrackResource(track)).toThrow('bad resource');
-        expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+        expect(() => manager.createTrackResource(track)).toThrow('bad resource');
+        expect(handle.stop).toHaveBeenCalledOnce();
     });
 
-    it('creates quiet elevator music and releases unregistered resources safely', () => {
+    it('creates quiet elevator music from the configured path', () => {
+        const { handle } = createHandle();
         const elevator = createResource({
             kind: 'elevator',
             id: 'elevator',
             title: 'Elevator Music'
         });
         createAudioResourceMock.mockReturnValue(elevator);
-        const manager = new AudioResourceManager(100, 'yt-dlp', 'C:\\music\\elevator.mp3');
+        const manager = new AudioResourceManager({
+            elevatorMusicPath: 'C:\\music\\elevator.mp3',
+            processes: createProcesses(handle)
+        });
 
         expect(manager.createElevatorResource()).toBe(elevator);
         expect(createAudioResourceMock).toHaveBeenCalledWith('C:\\music\\elevator.mp3', {
@@ -274,28 +192,28 @@ describe('AudioResourceManager', () => {
             }
         });
         expect(elevator.volume?.setVolume).toHaveBeenCalledWith(0.5);
-
-        const unknown = createResource();
-        manager.release(undefined);
-        manager.release(unknown);
-        expect(manager.isReleased(unknown)).toBe(true);
-        expect(unknown.playStream.destroyed).toBe(true);
     });
 
-    it('marks elevator resources released when their stream closes', () => {
+    it('releases unregistered and elevator resources safely', () => {
+        const { handle } = createHandle();
+        const manager = new AudioResourceManager({ processes: createProcesses(handle) });
+        const unknown = createResource();
+
+        manager.release(undefined);
+        manager.release(unknown);
+        manager.release(unknown);
+
+        expect(manager.isReleased(unknown)).toBe(true);
+        expect(unknown.playStream.destroyed).toBe(true);
+
         const elevator = createResource({
             kind: 'elevator',
             id: 'elevator',
             title: 'Elevator Music'
         });
         createAudioResourceMock.mockReturnValue(elevator);
-        const manager = new AudioResourceManager();
         manager.createElevatorResource();
-
         elevator.playStream.emit('close');
-
         expect(manager.isReleased(elevator)).toBe(true);
-        manager.release(elevator);
-        expect(elevator.playStream.destroyed).toBe(true);
     });
 });

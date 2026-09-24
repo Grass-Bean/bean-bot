@@ -38,6 +38,15 @@ describe('YtDlpProcessManager', () => {
         vi.useRealTimers();
     });
 
+    it('validates process-owned options', () => {
+        expect(() => new YtDlpProcessManager({ forceKillTimeoutMs: 1.5 })).toThrow(RangeError);
+        expect(() => new YtDlpProcessManager({ maxStderrBytes: 0 })).toThrow(RangeError);
+        expect(() => new YtDlpProcessManager({ command: '  ' })).toThrow(TypeError);
+        expect(() => new YtDlpProcessManager({
+            commandArgs: [1] as unknown as string[]
+        })).toThrow(TypeError);
+    });
+
     it('collects bounded output and applies the configured command prefix', async () => {
         const child = createProcess();
         spawnMock.mockReturnValue(child);
@@ -78,6 +87,40 @@ describe('YtDlpProcessManager', () => {
         expect(spawnMock).not.toHaveBeenCalled();
     });
 
+    it('cancels an active collection and stops its process', async () => {
+        const child = createProcess();
+        spawnMock.mockReturnValue(child);
+        const controller = new AbortController();
+        const result = new YtDlpProcessManager().collect([], {
+            signal: controller.signal,
+            timeoutMs: 100,
+            maxStdoutBytes: 100
+        });
+
+        controller.abort();
+
+        await expect(result).rejects.toMatchObject({ code: 'CANCELLED' });
+        expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    });
+
+    it('times out a collection and escalates termination', async () => {
+        vi.useFakeTimers();
+        const child = createProcess();
+        spawnMock.mockReturnValue(child);
+        const result = new YtDlpProcessManager({ forceKillTimeoutMs: 5 }).collect([], {
+            timeoutMs: 10,
+            maxStdoutBytes: 100
+        });
+        const rejection = expect(result).rejects.toMatchObject({ code: 'TIMEOUT' });
+
+        await vi.advanceTimersByTimeAsync(10);
+        await rejection;
+        expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+
+        await vi.advanceTimersByTimeAsync(5);
+        expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    });
+
     it('rejects oversized output immediately and escalates termination', async () => {
         vi.useFakeTimers();
         const child = createProcess();
@@ -93,23 +136,58 @@ describe('YtDlpProcessManager', () => {
         expect(child.kill).toHaveBeenCalledWith('SIGKILL');
     });
 
-    it('reports a process failure once even when exit and close both fire', async () => {
+    it('waits for close before reporting an exit failure with complete diagnostics', async () => {
         const child = createProcess();
         spawnMock.mockReturnValue(child);
         const handle = new YtDlpProcessManager().stream([]);
-        const onFailure = vi.fn();
-        handle.onFailure(onFailure);
+        const onCompletion = vi.fn();
+        void handle.completion.then(onCompletion);
 
-        child.stderr.emit('data', Buffer.from('diagnostic'));
+        child.stderr.emit('data', Buffer.from('first '));
         child.emit('exit', 2, null);
+        child.stderr.emit('data', Buffer.from('last'));
+
+        await Promise.resolve();
+        expect(onCompletion).not.toHaveBeenCalled();
+
         child.emit('close', 2, null);
 
-        expect(onFailure).toHaveBeenCalledTimes(1);
-        expect(onFailure).toHaveBeenCalledWith(expect.objectContaining({
-            code: 'PROCESS_FAILURE',
-            stderr: Buffer.from('diagnostic')
-        }));
-        await expect(handle.completion).resolves.toMatchObject({ status: 'failed' });
+        await expect(handle.completion).resolves.toMatchObject({
+            status: 'failed',
+            error: {
+                code: 'PROCESS_FAILURE',
+                stderr: Buffer.from('first last')
+            }
+        });
+        expect(onCompletion).toHaveBeenCalledOnce();
+    });
+
+    it.each([
+        ['stdout', 'STDOUT_FAILURE'],
+        ['stderr', 'STDERR_FAILURE']
+    ] as const)('normalizes %s stream failures', async (streamName, code) => {
+        const child = createProcess();
+        spawnMock.mockReturnValue(child);
+        const handle = new YtDlpProcessManager().stream([]);
+
+        child[streamName].emit('error', new Error(`${streamName} broke`));
+
+        await expect(handle.completion).resolves.toMatchObject({
+            status: 'failed',
+            error: { code }
+        });
+        expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    });
+
+    it('completes cleanly without stopping the process', async () => {
+        const child = createProcess();
+        spawnMock.mockReturnValue(child);
+        const handle = new YtDlpProcessManager().stream([]);
+
+        child.emit('close', 0, null);
+
+        await expect(handle.completion).resolves.toMatchObject({ status: 'succeeded' });
+        expect(child.kill).not.toHaveBeenCalled();
     });
 
     it('stops idempotently and cancels forced termination after close', async () => {
@@ -134,6 +212,19 @@ describe('YtDlpProcessManager', () => {
         await expect(handle.completion).resolves.toMatchObject({ status: 'stopped' });
     });
 
+    it('does not signal a process that has already exited', async () => {
+        const child = createProcess();
+        spawnMock.mockReturnValue(child);
+        const handle = new YtDlpProcessManager().stream([]);
+        child.exitCode = 0;
+
+        void handle.stop();
+        child.emit('close', 0, null);
+
+        expect(child.kill).not.toHaveBeenCalled();
+        await expect(handle.completion).resolves.toMatchObject({ status: 'stopped' });
+    });
+
     it('normalizes synchronous and asynchronous spawn failures', async () => {
         spawnMock.mockImplementationOnce(() => { throw 'synchronous failure'; });
         expect(() => new YtDlpProcessManager().stream([])).toThrow(YtDlpProcessError);
@@ -141,15 +232,15 @@ describe('YtDlpProcessManager', () => {
         const child = createProcess();
         spawnMock.mockReturnValueOnce(child);
         const handle = new YtDlpProcessManager().stream([]);
-        const onFailure = vi.fn();
-        handle.onFailure(onFailure);
         const error = new Error('missing executable');
         child.emit('error', error);
 
-        expect(onFailure).toHaveBeenCalledWith(expect.objectContaining({
-            code: 'SPAWN_FAILURE',
-            cause: error
-        }));
-        await expect(handle.completion).resolves.toMatchObject({ status: 'failed' });
+        await expect(handle.completion).resolves.toMatchObject({
+            status: 'failed',
+            error: {
+                code: 'SPAWN_FAILURE',
+                cause: error
+            }
+        });
     });
 });

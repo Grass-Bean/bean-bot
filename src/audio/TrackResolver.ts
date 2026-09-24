@@ -8,9 +8,9 @@ import type {
 } from './types.js';
 import {
     YtDlpProcessError,
-    YtDlpProcessManager,
     ytDlpProcessManager
 } from './YtDlpProcessManager.js';
+import { sanitizeLogText } from './sanitizeLogText.js';
 
 export type { TrackResolverErrorCode, TrackResolverOptions } from './types.js';
 
@@ -127,7 +127,7 @@ export class TrackResolver {
 
     public constructor(
         options: TrackResolverOptions = {},
-        processes?: YtDlpProcessClient
+        processes: YtDlpProcessClient = ytDlpProcessManager
     ) {
         this.timeoutMs = requireIntegerOption(
             'timeoutMs',
@@ -139,36 +139,8 @@ export class TrackResolver {
             options.maxStdoutBytes ?? 1_000_000,
             MAX_CONFIGURED_STDOUT_BYTES
         );
-        const forceKillTimeoutMs = requireIntegerOption(
-            'forceKillTimeoutMs',
-            options.forceKillTimeoutMs ?? 2_000,
-            MAX_TIMER_MS
-        );
         this.logDiagnostics = options.logDiagnostics ?? false;
-
-        const ytDlpCommand = options.ytDlpCommand ?? 'yt-dlp';
-        const ytDlpCommandArgs = [...(options.ytDlpCommandArgs ?? [])];
-        if (!ytDlpCommand.trim()) {
-            throw new TypeError('ytDlpCommand must not be empty.');
-        }
-
-        if (!ytDlpCommandArgs.every(argument => typeof argument === 'string')) {
-            throw new TypeError('ytDlpCommandArgs must contain only strings.');
-        }
-
-        const hasCustomProcessConfiguration =
-            options.forceKillTimeoutMs !== undefined ||
-            options.ytDlpCommand !== undefined ||
-            options.ytDlpCommandArgs !== undefined;
-        this.processes = processes ?? (
-            hasCustomProcessConfiguration
-                ? new YtDlpProcessManager({
-                    command: ytDlpCommand,
-                    commandArgs: ytDlpCommandArgs,
-                    forceKillTimeoutMs
-                })
-                : ytDlpProcessManager
-        );
+        this.processes = processes;
     }
 
     public async resolve(
@@ -322,7 +294,7 @@ export class TrackResolver {
         console.error(`[yt-dlp Error] ${outcome}`);
         if (!this.logDiagnostics) return;
 
-        const details = this.sanitizeLogText(
+        const details = sanitizeLogText(
             this.redactSensitiveUrls(stderrData.toString('utf8')),
             MAX_STDERR_BYTES
         );
@@ -331,7 +303,7 @@ export class TrackResolver {
 
     private logProcessError(error: Error): void {
         const code = (error as NodeJS.ErrnoException).code;
-        const summary = this.sanitizeLogText(
+        const summary = sanitizeLogText(
             this.redactSensitiveUrls(error.message),
             500
         );
@@ -350,12 +322,6 @@ export class TrackResolver {
         });
     }
 
-    private sanitizeLogText(value: string, maxLength: number): string {
-        return value
-            .replace(/[\u0000-\u001F\u007F-\u009F]+/g, ' ')
-            .trim()
-            .slice(0, maxLength);
-    }
 }
 
 export const trackResolver = new TrackResolver();

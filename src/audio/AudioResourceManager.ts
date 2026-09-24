@@ -3,16 +3,15 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type {
     AudioMetadata,
+    AudioResourceManagerOptions,
     BeanAudioResource,
     ElevatorMetadata,
     TrackMetadata,
     YtDlpProcessClient,
     YtDlpProcessFailure
 } from './types.js';
-import {
-    YtDlpProcessManager,
-    ytDlpProcessManager
-} from './YtDlpProcessManager.js';
+import { ytDlpProcessManager } from './YtDlpProcessManager.js';
+import { sanitizeLogText } from './sanitizeLogText.js';
 
 const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
 const defaultElevatorMusicPath = path.resolve(moduleDirectory, '../../assets/elevator.mp3');
@@ -21,21 +20,11 @@ export class AudioResourceManager {
     private readonly releasers = new WeakMap<BeanAudioResource, () => void>();
     private readonly releasedResources = new WeakSet<BeanAudioResource>();
     private readonly processes: YtDlpProcessClient;
+    private readonly elevatorMusicPath: string;
 
-    public constructor(
-        forceKillTimeoutMs = 2_000,
-        ytDlpCommand = 'yt-dlp',
-        private readonly elevatorMusicPath = defaultElevatorMusicPath,
-        processes?: YtDlpProcessClient
-    ) {
-        this.processes = processes ?? (
-            forceKillTimeoutMs === 2_000 && ytDlpCommand === 'yt-dlp'
-                ? ytDlpProcessManager
-                : new YtDlpProcessManager({
-                    command: ytDlpCommand,
-                    forceKillTimeoutMs
-                })
-        );
+    public constructor(options: AudioResourceManagerOptions = {}) {
+        this.processes = options.processes ?? ytDlpProcessManager;
+        this.elevatorMusicPath = options.elevatorMusicPath ?? defaultElevatorMusicPath;
     }
 
     public createTrackResource(metadata: TrackMetadata): BeanAudioResource {
@@ -52,28 +41,24 @@ export class AudioResourceManager {
         ]);
 
         let resource: BeanAudioResource | undefined;
-        let failureReported = false;
 
         const describeFailure = (error: YtDlpProcessFailure) => {
-            const safeSummary = this.sanitizeForLog(error.message, 500);
-            const details = this.sanitizeForLog(error.stderr.toString('utf8'), 8_000);
+            const safeSummary = sanitizeLogText(error.message, 500);
+            const details = sanitizeLogText(error.stderr.toString('utf8'), 8_000);
             return new Error(details ? `${safeSummary}: ${details}` : safeSummary);
         };
 
         const failResource = (error: Error) => {
-            if (failureReported) return;
-            failureReported = true;
-            console.error(`[yt-dlp] ${this.sanitizeForLog(metadata.title, 200)}:`, error.message);
-
-            // Child-process cleanup should not depend on Discord's stream events firing.
-            void ytProcess.stop();
+            console.error(`[yt-dlp] ${sanitizeLogText(metadata.title, 200)}:`, error.message);
 
             if (resource && !resource.playStream.destroyed) {
                 resource.playStream.destroy(error);
             }
         };
 
-        ytProcess.onFailure(error => failResource(describeFailure(error)));
+        void ytProcess.completion.then(outcome => {
+            if (outcome.status === 'failed') failResource(describeFailure(outcome.error));
+        });
 
         try {
             resource = createAudioResource<AudioMetadata>(ytProcess.stdout, {
@@ -125,10 +110,8 @@ export class AudioResourceManager {
     }
 
     private register(resource: BeanAudioResource, releaseSource?: () => void): void {
-        let released = false;
         const release = () => {
-            if (released) return;
-            released = true;
+            if (this.releasedResources.has(resource)) return;
 
             this.releasedResources.add(resource);
             this.releasers.delete(resource);
@@ -142,12 +125,6 @@ export class AudioResourceManager {
         resource.playStream.once('error', release);
     }
 
-    private sanitizeForLog(value: string, maxLength: number): string {
-        return value
-            .replace(/[\u0000-\u001F\u007F-\u009F]+/g, ' ')
-            .trim()
-            .slice(0, maxLength);
-    }
 }
 
 export const audioResourceManager = new AudioResourceManager();

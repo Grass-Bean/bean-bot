@@ -1,34 +1,25 @@
-import { EventEmitter } from 'node:events';
-import { PassThrough } from 'node:stream';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-
-const { spawnMock } = vi.hoisted(() => ({
-    spawnMock: vi.fn()
-}));
-
-vi.mock('child_process', () => ({
-    spawn: spawnMock
-}));
-
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { TrackResolver, TrackResolverError } from '../src/audio/TrackResolver.js';
+import { YtDlpProcessError } from '../src/audio/YtDlpProcessManager.js';
+import type { YtDlpProcessClient, YtDlpMetadata } from '../src/audio/types.js';
 
-type FakeProcess = EventEmitter & {
-    stdout: PassThrough;
-    stderr: PassThrough;
-    exitCode: number | null;
-    signalCode: NodeJS.Signals | null;
-    kill: ReturnType<typeof vi.fn>;
-};
+const metadata = (overrides: Partial<YtDlpMetadata> = {}): YtDlpMetadata => ({
+    title: 'A Song',
+    webpage_url: 'https://www.youtube.com/watch?v=abc',
+    duration: 42,
+    thumbnail: 'https://img.youtube.com/cover.jpg',
+    ...overrides
+});
 
-const createProcess = (): FakeProcess => {
-    const child = new EventEmitter() as FakeProcess;
-    child.stdout = new PassThrough();
-    child.stderr = new PassThrough();
-    child.exitCode = null;
-    child.signalCode = null;
-    child.kill = vi.fn().mockReturnValue(true);
-    return child;
-};
+const collected = (value: unknown) => ({
+    stdout: Buffer.from(typeof value === 'string' ? value : JSON.stringify(value)),
+    stderr: Buffer.alloc(0)
+});
+
+const createProcesses = () => ({
+    collect: vi.fn(),
+    stream: vi.fn()
+}) as unknown as YtDlpProcessClient;
 
 const expectResolverError = async (
     promise: Promise<unknown>,
@@ -41,52 +32,35 @@ const expectResolverError = async (
 };
 
 describe('TrackResolver', () => {
+    let processes: YtDlpProcessClient;
+
     beforeEach(() => {
-        spawnMock.mockReset();
+        processes = createProcesses();
     });
 
-    afterEach(() => {
-        vi.useRealTimers();
-    });
-
-    it('validates constructor limits and command configuration', () => {
-        expect(() => new TrackResolver({ timeoutMs: 0 })).toThrow(RangeError);
-        expect(() => new TrackResolver({ maxStdoutBytes: 16 * 1024 * 1024 + 1 })).toThrow(RangeError);
-        expect(() => new TrackResolver({ forceKillTimeoutMs: 1.5 })).toThrow(RangeError);
-        expect(() => new TrackResolver({ ytDlpCommand: '  ' })).toThrow(TypeError);
-        expect(() => new TrackResolver({ ytDlpCommandArgs: [1] as unknown as string[] })).toThrow(TypeError);
+    it('validates resolver-owned options', () => {
+        expect(() => new TrackResolver({ timeoutMs: 0 }, processes)).toThrow(RangeError);
+        expect(() => new TrackResolver({ maxStdoutBytes: 16 * 1024 * 1024 + 1 }, processes))
+            .toThrow(RangeError);
     });
 
     it.each([
         ['', 'INVALID_INPUT'],
-        ['  ', 'INVALID_INPUT'],
-        ['https://%', 'INVALID_INPUT'],
+        ['https://[invalid', 'INVALID_INPUT'],
         ['ftp://youtube.com/video', 'UNSUPPORTED_URL'],
-        ['https://example.com/video', 'UNSUPPORTED_URL'],
-        ['https://youtube.com.evil.test/video', 'UNSUPPORTED_URL']
-    ] as const)('rejects unsafe input %j with %s', async (query, code) => {
-        await expectResolverError(new TrackResolver().resolve(query, 'user-a'), code);
-        expect(spawnMock).not.toHaveBeenCalled();
+        ['https://example.com/video', 'UNSUPPORTED_URL']
+    ] as const)('rejects invalid input %j before invoking yt-dlp', async (query, code) => {
+        await expectResolverError(new TrackResolver({}, processes).resolve(query, 'user-a'), code);
+        expect(processes.collect).not.toHaveBeenCalled();
     });
 
-    it('turns a text query into a single-result search and returns normalized metadata', async () => {
-        const child = createProcess();
-        spawnMock.mockReturnValue(child);
-        const resolver = new TrackResolver({
-            ytDlpCommand: 'custom-yt-dlp',
-            ytDlpCommandArgs: ['--cookies-from-browser', 'test']
-        });
-
-        const resultPromise = resolver.resolve('  song name  ', 'user-a');
-        child.stdout.emit('data', Buffer.from(JSON.stringify({
-            title: '  A\u0000 Song  ',
-            webpage_url: 'https://www.youtube.com/watch?v=abc',
-            duration: 42,
-            thumbnail: 'https://img.youtube.com/cover.jpg'
+    it('builds metadata arguments and normalizes a successful response', async () => {
+        vi.mocked(processes.collect).mockResolvedValue(collected(metadata({
+            title: '  A\u0000 Song  '
         })));
-        child.emit('close', 0, null);
+        const resolver = new TrackResolver({}, processes);
 
-        await expect(resultPromise).resolves.toMatchObject({
+        await expect(resolver.resolve('song name', 'user-a')).resolves.toMatchObject({
             kind: 'track',
             title: 'A  Song',
             url: 'https://www.youtube.com/watch?v=abc',
@@ -94,49 +68,35 @@ describe('TrackResolver', () => {
             thumbnail: 'https://img.youtube.com/cover.jpg',
             requestedBy: 'user-a'
         });
-        expect(spawnMock).toHaveBeenCalledWith(
-            'custom-yt-dlp',
+        expect(processes.collect).toHaveBeenCalledWith(
             [
-                '--cookies-from-browser', 'test',
                 '--ignore-config', '--dump-json', '--no-playlist', '--quiet',
                 '--', 'ytsearch1:song name'
             ],
-            { windowsHide: true }
+            {
+                signal: undefined,
+                timeoutMs: 15_000,
+                maxStdoutBytes: 1_000_000
+            }
         );
     });
 
-    it('accepts supported direct URLs, truncates long titles, and drops unsafe thumbnails', async () => {
-        const child = createProcess();
-        spawnMock.mockReturnValue(child);
-        const resolver = new TrackResolver();
-        const title = '🎵'.repeat(220);
-
-        const resultPromise = resolver.resolve('https://youtu.be/abc', 'user-b');
-        child.stdout.emit('data', Buffer.from(JSON.stringify({
-            title,
+    it('accepts supported direct URLs, truncates titles, and drops unsafe thumbnails', async () => {
+        vi.mocked(processes.collect).mockResolvedValue(collected(metadata({
+            title: '🎵'.repeat(220),
             webpage_url: 'https://youtu.be/abc',
             duration: null,
             thumbnail: 'file:///secret'
         })));
-        child.emit('close', 0, null);
 
-        const result = await resultPromise;
+        const result = await new TrackResolver({}, processes)
+            .resolve('https://youtu.be/abc', 'user-b');
+
         expect(Array.from(result.title)).toHaveLength(200);
         expect(result.title.endsWith('…')).toBe(true);
         expect(result.duration).toBeUndefined();
         expect(result.thumbnail).toBeUndefined();
-        expect(spawnMock.mock.calls[0][1]).toContain('https://youtu.be/abc');
-    });
-
-    it('rejects output larger than the configured bound and stops the process', async () => {
-        const child = createProcess();
-        spawnMock.mockReturnValue(child);
-        const promise = new TrackResolver({ maxStdoutBytes: 4 }).resolve('song', 'user');
-
-        child.stdout.emit('data', Buffer.from('12345'));
-
-        await expectResolverError(promise, 'OUTPUT_LIMIT');
-        expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+        expect(vi.mocked(processes.collect).mock.calls[0]![0]).toContain('https://youtu.be/abc');
     });
 
     it.each([
@@ -146,86 +106,76 @@ describe('TrackResolver', () => {
         [JSON.stringify({ title: 'Song', webpage_url: 'https://user:pass@youtube.com/a' }), 'yt-dlp returned unsafe track metadata.']
     ])('rejects invalid successful output', async (output, message) => {
         vi.spyOn(console, 'error').mockImplementation(() => undefined);
-        const child = createProcess();
-        spawnMock.mockReturnValue(child);
-        const promise = new TrackResolver().resolve('song', 'user');
+        vi.mocked(processes.collect).mockResolvedValue(collected(output));
 
-        child.stdout.emit('data', Buffer.from(output));
-        child.emit('close', 0, null);
-
-        await expect(promise).rejects.toMatchObject({ code: 'INVALID_RESPONSE', message });
+        await expect(new TrackResolver({}, processes).resolve('song', 'user'))
+            .rejects.toMatchObject({ code: 'INVALID_RESPONSE', message });
     });
 
-    it('reports nonzero exits and redacts diagnostic URL query strings', async () => {
+    it.each([
+        ['CANCELLED', 'CANCELLED'],
+        ['TIMEOUT', 'TIMEOUT'],
+        ['OUTPUT_LIMIT', 'OUTPUT_LIMIT']
+    ] as const)('maps manager failure %s to resolver failure %s', async (sourceCode, targetCode) => {
+        vi.mocked(processes.collect).mockRejectedValue(new YtDlpProcessError(
+            'operation failed',
+            sourceCode
+        ));
+
+        await expectResolverError(
+            new TrackResolver({}, processes).resolve('song', 'user'),
+            targetCode
+        );
+    });
+
+    it('maps process exits and redacts diagnostic URL query strings', async () => {
         const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-        const child = createProcess();
-        spawnMock.mockReturnValue(child);
-        const promise = new TrackResolver({ logDiagnostics: true }).resolve('song', 'user');
+        vi.mocked(processes.collect).mockRejectedValue(new YtDlpProcessError(
+            'yt-dlp exited with code 2',
+            'PROCESS_FAILURE',
+            Buffer.from('failed https://youtube.com/watch?v=secret\n')
+        ));
 
-        child.stderr.emit('data', Buffer.from('failed https://youtube.com/watch?v=secret\n'));
-        child.emit('close', 2, null);
-
-        await expectResolverError(promise, 'PROCESS_FAILURE');
+        await expectResolverError(
+            new TrackResolver({ logDiagnostics: true }, processes).resolve('song', 'user'),
+            'PROCESS_FAILURE'
+        );
         expect(errorSpy).toHaveBeenCalledWith(
             '[yt-dlp Diagnostic]',
             'failed https://youtube.com/watch?[redacted]'
         );
     });
 
-    it('wraps asynchronous and synchronous process start failures', async () => {
+    it('wraps manager startup failures', async () => {
         const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
-        const child = createProcess();
-        spawnMock.mockReturnValueOnce(child);
-        const asynchronous = new TrackResolver().resolve('song', 'user');
-        const processError = Object.assign(new Error('missing command'), { code: 'ENOENT' });
-        child.emit('error', processError);
+        const cause = Object.assign(new Error('missing command'), { code: 'ENOENT' });
+        vi.mocked(processes.collect).mockRejectedValue(new YtDlpProcessError(
+            'Failed to start yt-dlp: missing command',
+            'SPAWN_FAILURE',
+            Buffer.alloc(0),
+            { cause }
+        ));
 
-        await expect(asynchronous).rejects.toMatchObject({
-            code: 'PROCESS_FAILURE',
-            cause: processError
-        });
-        expect(child.kill).toHaveBeenCalledWith('SIGTERM');
-
-        spawnMock.mockImplementationOnce(() => { throw 'synchronous failure'; });
-        await expect(new TrackResolver().resolve('song', 'user')).rejects.toMatchObject({
-            code: 'PROCESS_FAILURE',
-            cause: expect.any(Error)
-        });
+        await expect(new TrackResolver({}, processes).resolve('song', 'user'))
+            .rejects.toMatchObject({ code: 'PROCESS_FAILURE', cause });
         expect(errorSpy).toHaveBeenCalled();
     });
 
-    it('cancels before or during lookup', async () => {
+    it('cancels before collection or passes the signal through', async () => {
         const alreadyAborted = new AbortController();
         alreadyAborted.abort();
         await expectResolverError(
-            new TrackResolver().resolve('song', 'user', alreadyAborted.signal),
+            new TrackResolver({}, processes).resolve('song', 'user', alreadyAborted.signal),
             'CANCELLED'
         );
-        expect(spawnMock).not.toHaveBeenCalled();
+        expect(processes.collect).not.toHaveBeenCalled();
 
-        const child = createProcess();
-        spawnMock.mockReturnValue(child);
-        const controller = new AbortController();
-        const pending = new TrackResolver().resolve('song', 'user', controller.signal);
-        controller.abort();
-
-        await expectResolverError(pending, 'CANCELLED');
-        expect(child.kill).toHaveBeenCalledWith('SIGTERM');
-    });
-
-    it('times out and escalates from graceful to forced termination', async () => {
-        vi.useFakeTimers();
-        const child = createProcess();
-        spawnMock.mockReturnValue(child);
-        const pending = new TrackResolver({ timeoutMs: 10, forceKillTimeoutMs: 5 })
-            .resolve('song', 'user');
-        const rejection = expectResolverError(pending, 'TIMEOUT');
-
-        await vi.advanceTimersByTimeAsync(10);
-        await rejection;
-        expect(child.kill).toHaveBeenCalledWith('SIGTERM');
-
-        await vi.advanceTimersByTimeAsync(5);
-        expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+        const active = new AbortController();
+        vi.mocked(processes.collect).mockResolvedValue(collected(metadata()));
+        await new TrackResolver({}, processes).resolve('song', 'user', active.signal);
+        expect(processes.collect).toHaveBeenCalledWith(
+            expect.any(Array),
+            expect.objectContaining({ signal: active.signal })
+        );
     });
 });

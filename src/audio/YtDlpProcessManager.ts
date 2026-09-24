@@ -202,9 +202,7 @@ export class YtDlpProcessManager implements YtDlpProcessClient {
         let stopRequested = false;
         let processClosed = false;
         let outcomeSettled = false;
-        let settledOutcome: YtDlpProcessOutcome | undefined;
         let forceKillTimer: NodeJS.Timeout | undefined;
-        const failureListeners = new Set<(error: YtDlpProcessError) => void>();
         let resolveCompletion!: (outcome: YtDlpProcessOutcome) => void;
         let resolveClosed!: () => void;
 
@@ -228,15 +226,7 @@ export class YtDlpProcessManager implements YtDlpProcessClient {
         const settle = (outcome: YtDlpProcessOutcome) => {
             if (outcomeSettled) return;
             outcomeSettled = true;
-            settledOutcome = outcome;
             resolveCompletion(outcome);
-            if (outcome.status === 'failed') {
-                const listeners = [...failureListeners];
-                failureListeners.clear();
-                for (const listener of listeners) listener(outcome.error);
-            } else {
-                failureListeners.clear();
-            }
         };
 
         const createFailure = (
@@ -287,7 +277,6 @@ export class YtDlpProcessManager implements YtDlpProcessClient {
                 status: 'failed',
                 exitCode: child.exitCode,
                 signal: child.signalCode,
-                stderr: error.stderr,
                 error
             });
             void stop();
@@ -318,21 +307,6 @@ export class YtDlpProcessManager implements YtDlpProcessClient {
                 error
             ));
         });
-        child.once('exit', (exitCode, signal) => {
-            if (stopRequested || exitCode === 0 || outcomeSettled) return;
-
-            const outcome = exitCode === null
-                ? `yt-dlp was terminated by ${signal ?? 'an unknown signal'}`
-                : `yt-dlp exited with code ${exitCode}`;
-            const error = createFailure(outcome, 'PROCESS_FAILURE');
-            settle({
-                status: 'failed',
-                exitCode,
-                signal,
-                stderr: error.stderr,
-                error
-            });
-        });
         child.once('close', (exitCode, signal) => {
             processClosed = true;
             clearForceKillTimer();
@@ -358,20 +332,10 @@ export class YtDlpProcessManager implements YtDlpProcessClient {
                 ? `yt-dlp closed after signal ${signal ?? 'unknown'}`
                 : `yt-dlp closed with code ${exitCode}`;
             const error = createFailure(outcome, 'PROCESS_FAILURE');
-            settle({ status: 'failed', ...exit, error });
+            settle({ status: 'failed', exitCode, signal, error });
         });
 
-        const onFailure = (listener: (error: YtDlpProcessError) => void): (() => void) => {
-            if (settledOutcome) {
-                if (settledOutcome.status === 'failed') listener(settledOutcome.error);
-                return () => undefined;
-            }
-
-            failureListeners.add(listener);
-            return () => failureListeners.delete(listener);
-        };
-
-        return { stdout: child.stdout, completion, onFailure, stop };
+        return { stdout: child.stdout, completion, stop };
     }
 }
 

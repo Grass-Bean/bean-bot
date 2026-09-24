@@ -122,8 +122,7 @@ export class GuildAudioSessionManager {
             void this.schedule(session, async () => {
                 if (session.current !== endedResource) return;
                 if (endedResource) {
-                    this.resources.release(endedResource);
-                    session.current = undefined;
+                    this.releaseCurrent(session);
                 }
                 await this.startNext(session);
             });
@@ -238,8 +237,7 @@ export class GuildAudioSessionManager {
             if (!stopped) {
                 void this.schedule(session, async () => {
                     if (session.current?.metadata.kind !== 'elevator') return;
-                    this.resources.release(session.current);
-                    session.current = undefined;
+                    this.releaseCurrent(session);
                     await this.startNext(session);
                 });
             }
@@ -454,10 +452,8 @@ export class GuildAudioSessionManager {
 
         session.player.removeAllListeners();
         session.player.stop(true);
-        this.resources.release(session.current);
-        this.resources.release(session.preload);
-        session.current = undefined;
-        session.preload = undefined;
+        this.releaseCurrent(session);
+        this.releasePreload(session);
         session.queue = new Deque<QueuedTrack>();
 
         if (destroyConnection && session.connection.state.status !== VoiceConnectionStatus.Destroyed) {
@@ -494,8 +490,7 @@ export class GuildAudioSessionManager {
                 return;
             } catch (error) {
                 console.error(`Failed to play ${track.title} in guild ${session.guildId}:`, error);
-                this.resources.release(session.current);
-                session.current = undefined;
+                this.releaseCurrent(session);
                 this.notify(session, `⚠️ Could not play **${escapeMarkdown(track.title)}**. Skipping...`);
             }
         }
@@ -523,8 +518,7 @@ export class GuildAudioSessionManager {
         const currentPreload = session.preload;
 
         if (!nextQueuedTrack) {
-            this.resources.release(currentPreload);
-            session.preload = undefined;
+            this.releasePreload(session);
             return;
         }
 
@@ -538,7 +532,7 @@ export class GuildAudioSessionManager {
             return;
         }
 
-        this.resources.release(currentPreload);
+        this.releasePreload(session);
         try {
             session.preload = this.resources.createTrackResource(nextTrack);
         } catch (error) {
@@ -551,8 +545,7 @@ export class GuildAudioSessionManager {
         if (session.closing || session.current) return;
 
         this.clearTrackWatchdog(session);
-        this.resources.release(session.preload);
-        session.preload = undefined;
+        this.releasePreload(session);
 
         try {
             const elevatorResource = this.resources.createElevatorResource();
@@ -653,10 +646,19 @@ export class GuildAudioSessionManager {
 
         void this.schedule(session, async () => {
             if (session.current !== resource) return;
-            this.resources.release(resource);
-            session.current = undefined;
+            this.releaseCurrent(session);
             await this.startNext(session);
         });
+    }
+
+    private releaseCurrent(session: GuildAudioSession): void {
+        this.resources.release(session.current);
+        session.current = undefined;
+    }
+
+    private releasePreload(session: GuildAudioSession): void {
+        this.resources.release(session.preload);
+        session.preload = undefined;
     }
 
     private clearTrackWatchdog(session: GuildAudioSession, expected?: NodeJS.Timeout): void {

@@ -114,12 +114,16 @@ export interface YtDlpProcessExit {
 
 export type YtDlpProcessOutcome =
     | ({ status: 'succeeded' | 'stopped' } & YtDlpProcessExit)
-    | ({ status: 'failed'; error: YtDlpProcessFailure } & YtDlpProcessExit);
+    | {
+        status: 'failed';
+        exitCode: number | null;
+        signal: NodeJS.Signals | null;
+        error: YtDlpProcessFailure;
+    };
 
 export interface YtDlpStreamHandle {
     readonly stdout: Readable;
     readonly completion: Promise<YtDlpProcessOutcome>;
-    onFailure(listener: (error: YtDlpProcessFailure) => void): () => void;
     stop(): Promise<void>;
 }
 
@@ -143,8 +147,10 @@ export type TrackResolverErrorCode =
 export interface TrackResolverOptions {
     timeoutMs?: number;
     maxStdoutBytes?: number;
-    forceKillTimeoutMs?: number;
-    ytDlpCommand?: string;
-    ytDlpCommandArgs?: readonly string[];
     logDiagnostics?: boolean;
+}
+
+export interface AudioResourceManagerOptions {
+    elevatorMusicPath?: string;
+    processes?: YtDlpProcessClient;
 }
