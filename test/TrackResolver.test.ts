@@ -70,7 +70,8 @@ describe('TrackResolver', () => {
         });
         expect(processes.collect).toHaveBeenCalledWith(
             [
-                '--ignore-config', '--dump-json', '--no-playlist', '--quiet',
+                '--ignore-config', '--no-playlist', '--quiet',
+                '--print', '%(.{title,webpage_url,duration,thumbnail})j',
                 '--', 'ytsearch1:song name'
             ],
             {

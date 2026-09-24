@@ -282,9 +282,10 @@ export class TrackResolver {
     private createArguments(input: string): string[] {
         return [
             '--ignore-config',
-            '--dump-json',
             '--no-playlist',
             '--quiet',
+            '--print',
+            '%(.{title,webpage_url,duration,thumbnail})j',
             '--',
             input
         ];
