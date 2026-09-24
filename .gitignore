@@ -1,6 +1,7 @@
 package-lock.json
 node_modules/
 dist/
+coverage/
 config.json
 .env
 *.mp3
