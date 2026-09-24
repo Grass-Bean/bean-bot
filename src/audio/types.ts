@@ -4,6 +4,7 @@ import type {
     VoiceConnection
 } from '@discordjs/voice';
 import type { TextChannel } from 'discord.js';
+import type { Readable } from 'node:stream';
 import type { Deque } from './Deque.js';
 
 export interface TrackMetadata {
@@ -71,6 +72,63 @@ export interface YtDlpMetadata {
     webpage_url: string;
     duration?: number | null;
     thumbnail?: string | null;
+}
+
+export type YtDlpProcessErrorCode =
+    | 'SPAWN_FAILURE'
+    | 'PROCESS_FAILURE'
+    | 'STDOUT_FAILURE'
+    | 'STDERR_FAILURE'
+    | 'TIMEOUT'
+    | 'CANCELLED'
+    | 'OUTPUT_LIMIT';
+
+export interface YtDlpProcessFailure extends Error {
+    readonly code: YtDlpProcessErrorCode;
+    readonly stderr: Buffer;
+}
+
+export interface YtDlpProcessManagerOptions {
+    command?: string;
+    commandArgs?: readonly string[];
+    forceKillTimeoutMs?: number;
+    maxStderrBytes?: number;
+}
+
+export interface YtDlpCollectOptions {
+    signal?: AbortSignal;
+    timeoutMs: number;
+    maxStdoutBytes: number;
+}
+
+export interface YtDlpCollectedOutput {
+    stdout: Buffer;
+    stderr: Buffer;
+}
+
+export interface YtDlpProcessExit {
+    exitCode: number | null;
+    signal: NodeJS.Signals | null;
+    stderr: Buffer;
+}
+
+export type YtDlpProcessOutcome =
+    | ({ status: 'succeeded' | 'stopped' } & YtDlpProcessExit)
+    | ({ status: 'failed'; error: YtDlpProcessFailure } & YtDlpProcessExit);
+
+export interface YtDlpStreamHandle {
+    readonly stdout: Readable;
+    readonly completion: Promise<YtDlpProcessOutcome>;
+    onFailure(listener: (error: YtDlpProcessFailure) => void): () => void;
+    stop(): Promise<void>;
+}
+
+export interface YtDlpProcessClient {
+    collect(
+        args: readonly string[],
+        options: YtDlpCollectOptions
+    ): Promise<YtDlpCollectedOutput>;
+    stream(args: readonly string[]): YtDlpStreamHandle;
 }
 
 export type TrackResolverErrorCode =

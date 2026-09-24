@@ -1,8 +1,18 @@
 import { createAudioResource, StreamType } from '@discordjs/voice';
-import { spawn } from 'child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { AudioMetadata, BeanAudioResource, ElevatorMetadata, TrackMetadata } from './types.js';
+import type {
+    AudioMetadata,
+    BeanAudioResource,
+    ElevatorMetadata,
+    TrackMetadata,
+    YtDlpProcessClient,
+    YtDlpProcessFailure
+} from './types.js';
+import {
+    YtDlpProcessManager,
+    ytDlpProcessManager
+} from './YtDlpProcessManager.js';
 
 const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
 const defaultElevatorMusicPath = path.resolve(moduleDirectory, '../../assets/elevator.mp3');
@@ -10,15 +20,26 @@ const defaultElevatorMusicPath = path.resolve(moduleDirectory, '../../assets/ele
 export class AudioResourceManager {
     private readonly releasers = new WeakMap<BeanAudioResource, () => void>();
     private readonly releasedResources = new WeakSet<BeanAudioResource>();
+    private readonly processes: YtDlpProcessClient;
 
     public constructor(
-        private readonly forceKillTimeoutMs = 2_000,
-        private readonly ytDlpCommand = 'yt-dlp',
-        private readonly elevatorMusicPath = defaultElevatorMusicPath
-    ) {}
+        forceKillTimeoutMs = 2_000,
+        ytDlpCommand = 'yt-dlp',
+        private readonly elevatorMusicPath = defaultElevatorMusicPath,
+        processes?: YtDlpProcessClient
+    ) {
+        this.processes = processes ?? (
+            forceKillTimeoutMs === 2_000 && ytDlpCommand === 'yt-dlp'
+                ? ytDlpProcessManager
+                : new YtDlpProcessManager({
+                    command: ytDlpCommand,
+                    forceKillTimeoutMs
+                })
+        );
+    }
 
     public createTrackResource(metadata: TrackMetadata): BeanAudioResource {
-        const ytProcess = spawn(this.ytDlpCommand, [
+        const ytProcess = this.processes.stream([
             '--ignore-config',
             '--no-playlist',
             '-q',
@@ -28,104 +49,31 @@ export class AudioResourceManager {
             '--extractor-args', 'youtube:player_client=default',
             '--',
             metadata.url
-        ], { windowsHide: true });
+        ]);
 
         let resource: BeanAudioResource | undefined;
-        let stderrData = '';
-        let shutdownRequested = false;
-        let processClosed = false;
         let failureReported = false;
-        let forceKillTimer: NodeJS.Timeout | undefined;
 
-        const hasExited = () => (
-            processClosed || ytProcess.exitCode !== null || ytProcess.signalCode !== null
-        );
-
-        const clearForceKillTimer = () => {
-            if (!forceKillTimer) return;
-            clearTimeout(forceKillTimer);
-            forceKillTimer = undefined;
-        };
-
-        const detachAndDrainOutput = () => {
-            ytProcess.stdout.unpipe();
-            if (!ytProcess.stdout.destroyed && !ytProcess.stdout.readableEnded) {
-                ytProcess.stdout.resume();
-            }
-        };
-
-        const stopProcess = () => {
-            if (shutdownRequested) return;
-            shutdownRequested = true;
-            detachAndDrainOutput();
-
-            if (hasExited()) return;
-
-            ytProcess.kill('SIGTERM');
-            if (hasExited()) return;
-
-            forceKillTimer = setTimeout(() => {
-                forceKillTimer = undefined;
-                if (!hasExited()) ytProcess.kill('SIGKILL');
-            }, this.forceKillTimeoutMs);
-            forceKillTimer.unref();
-        };
-
-        const describeFailure = (summary: string) => {
-            const safeSummary = this.sanitizeForLog(summary, 500);
-            const details = this.sanitizeForLog(stderrData, 8_000);
+        const describeFailure = (error: YtDlpProcessFailure) => {
+            const safeSummary = this.sanitizeForLog(error.message, 500);
+            const details = this.sanitizeForLog(error.stderr.toString('utf8'), 8_000);
             return new Error(details ? `${safeSummary}: ${details}` : safeSummary);
         };
 
         const failResource = (error: Error) => {
-            if (shutdownRequested || failureReported) return;
+            if (failureReported) return;
             failureReported = true;
             console.error(`[yt-dlp] ${this.sanitizeForLog(metadata.title, 200)}:`, error.message);
 
             // Child-process cleanup should not depend on Discord's stream events firing.
-            stopProcess();
+            void ytProcess.stop();
 
             if (resource && !resource.playStream.destroyed) {
                 resource.playStream.destroy(error);
             }
         };
 
-        ytProcess.stderr.on('data', (data) => {
-            stderrData = `${stderrData}${data.toString()}`.slice(-8_000);
-        });
-
-        // These listeners are registered before resource construction so a synchronous
-        // createAudioResource failure cannot leave an unobserved child stream error.
-        ytProcess.stdout.on('error', (error) => {
-            failResource(describeFailure(`yt-dlp stdout failed: ${error.message}`));
-        });
-        ytProcess.stderr.on('error', (error) => {
-            failResource(describeFailure(`yt-dlp stderr failed: ${error.message}`));
-        });
-        ytProcess.once('error', (error) => {
-            failResource(describeFailure(`Failed to start yt-dlp: ${error.message}`));
-        });
-        ytProcess.once('exit', (code, signal) => {
-            if (shutdownRequested || code === 0) return;
-
-            const outcome = code === null
-                ? `yt-dlp was terminated by ${signal ?? 'an unknown signal'}`
-                : `yt-dlp exited with code ${code}`;
-            failResource(describeFailure(outcome));
-        });
-        ytProcess.once('close', (code, signal) => {
-            processClosed = true;
-            clearForceKillTimer();
-
-            // The exit event normally reports this first. Keep close as a fallback because
-            // it is the authoritative point at which the stdio streams have also closed.
-            if (!shutdownRequested && code !== 0 && !failureReported) {
-                const outcome = code === null
-                    ? `yt-dlp closed after signal ${signal ?? 'unknown'}`
-                    : `yt-dlp closed with code ${code}`;
-                failResource(describeFailure(outcome));
-            }
-        });
+        ytProcess.onFailure(error => failResource(describeFailure(error)));
 
         try {
             resource = createAudioResource<AudioMetadata>(ytProcess.stdout, {
@@ -134,11 +82,11 @@ export class AudioResourceManager {
                 metadata
             });
         } catch (error) {
-            stopProcess();
+            void ytProcess.stop();
             throw error;
         }
 
-        this.register(resource, stopProcess);
+        this.register(resource, () => void ytProcess.stop());
 
         return resource;
     }

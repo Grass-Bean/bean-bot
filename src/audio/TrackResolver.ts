@@ -1,11 +1,16 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { randomUUID } from 'crypto';
 import type {
     TrackMetadata,
     TrackResolverErrorCode,
     TrackResolverOptions,
-    YtDlpMetadata
+    YtDlpMetadata,
+    YtDlpProcessClient
 } from './types.js';
+import {
+    YtDlpProcessError,
+    YtDlpProcessManager,
+    ytDlpProcessManager
+} from './YtDlpProcessManager.js';
 
 export type { TrackResolverErrorCode, TrackResolverOptions } from './types.js';
 
@@ -117,12 +122,13 @@ const asError = (value: unknown): Error => (
 export class TrackResolver {
     private readonly timeoutMs: number;
     private readonly maxStdoutBytes: number;
-    private readonly forceKillTimeoutMs: number;
-    private readonly ytDlpCommand: string;
-    private readonly ytDlpCommandArgs: readonly string[];
     private readonly logDiagnostics: boolean;
+    private readonly processes: YtDlpProcessClient;
 
-    public constructor(options: TrackResolverOptions = {}) {
+    public constructor(
+        options: TrackResolverOptions = {},
+        processes?: YtDlpProcessClient
+    ) {
         this.timeoutMs = requireIntegerOption(
             'timeoutMs',
             options.timeoutMs ?? 15_000,
@@ -133,22 +139,36 @@ export class TrackResolver {
             options.maxStdoutBytes ?? 1_000_000,
             MAX_CONFIGURED_STDOUT_BYTES
         );
-        this.forceKillTimeoutMs = requireIntegerOption(
+        const forceKillTimeoutMs = requireIntegerOption(
             'forceKillTimeoutMs',
             options.forceKillTimeoutMs ?? 2_000,
             MAX_TIMER_MS
         );
-        this.ytDlpCommand = options.ytDlpCommand ?? 'yt-dlp';
-        this.ytDlpCommandArgs = [...(options.ytDlpCommandArgs ?? [])];
         this.logDiagnostics = options.logDiagnostics ?? false;
 
-        if (!this.ytDlpCommand.trim()) {
+        const ytDlpCommand = options.ytDlpCommand ?? 'yt-dlp';
+        const ytDlpCommandArgs = [...(options.ytDlpCommandArgs ?? [])];
+        if (!ytDlpCommand.trim()) {
             throw new TypeError('ytDlpCommand must not be empty.');
         }
 
-        if (!this.ytDlpCommandArgs.every(argument => typeof argument === 'string')) {
+        if (!ytDlpCommandArgs.every(argument => typeof argument === 'string')) {
             throw new TypeError('ytDlpCommandArgs must contain only strings.');
         }
+
+        const hasCustomProcessConfiguration =
+            options.forceKillTimeoutMs !== undefined ||
+            options.ytDlpCommand !== undefined ||
+            options.ytDlpCommandArgs !== undefined;
+        this.processes = processes ?? (
+            hasCustomProcessConfiguration
+                ? new YtDlpProcessManager({
+                    command: ytDlpCommand,
+                    commandArgs: ytDlpCommandArgs,
+                    forceKillTimeoutMs
+                })
+                : ytDlpProcessManager
+        );
     }
 
     public async resolve(
@@ -159,193 +179,94 @@ export class TrackResolver {
         const input = this.resolveInput(query);
         if (signal?.aborted) throw createCancellationError();
 
-        return new Promise<TrackMetadata>((resolve, reject) => {
-            // Promise settlement and child-process shutdown are separate lifecycle states.
-            let settled = false;
-            let processClosed = false;
-            let shutdownRequested = false;
-            const stdoutChunks: Buffer[] = [];
-            let stdoutBytes = 0;
-            let stderrData = Buffer.alloc(0);
-            let deadlineTimer: NodeJS.Timeout | undefined;
-            let forceKillTimer: NodeJS.Timeout | undefined;
+        let stdout: Buffer;
+        try {
+            ({ stdout } = await this.processes.collect(this.createArguments(input), {
+                signal,
+                timeoutMs: this.timeoutMs,
+                maxStdoutBytes: this.maxStdoutBytes
+            }));
+        } catch (error) {
+            throw this.mapProcessError(error);
+        }
 
-            let ytProcess: ChildProcessWithoutNullStreams;
-            try {
-                ytProcess = spawn(
-                    this.ytDlpCommand,
-                    this.createArguments(input),
-                    { windowsHide: true }
-                );
-            } catch (error) {
-                const cause = asError(error);
-                this.logProcessError(cause);
-                reject(new TrackResolverError(
-                    'Track metadata process failed.',
-                    'PROCESS_FAILURE',
-                    { cause }
-                ));
-                return;
-            }
-
-            const hasExited = () => (
-                processClosed || ytProcess.exitCode !== null || ytProcess.signalCode !== null
+        let data: unknown;
+        try {
+            data = JSON.parse(stdout.toString('utf8'));
+        } catch (error) {
+            const cause = asError(error);
+            console.error('[yt-dlp Parse Error] Failed to parse metadata JSON.');
+            throw new TrackResolverError(
+                'yt-dlp returned malformed metadata.',
+                'INVALID_RESPONSE',
+                { cause }
             );
+        }
 
-            const clearForceKillTimer = () => {
-                if (!forceKillTimer) return;
-                clearTimeout(forceKillTimer);
-                forceKillTimer = undefined;
-            };
+        if (!isYtDlpMetadata(data)) {
+            throw new TrackResolverError(
+                'yt-dlp returned incomplete track metadata.',
+                'INVALID_RESPONSE'
+            );
+        }
 
-            const stopProcess = () => {
-                if (shutdownRequested) return;
-                shutdownRequested = true;
+        const title = normalizeTrackTitle(data.title);
+        const mediaUrl = normalizeMediaUrl(data.webpage_url);
+        if (!title || !mediaUrl) {
+            throw new TrackResolverError(
+                'yt-dlp returned unsafe track metadata.',
+                'INVALID_RESPONSE'
+            );
+        }
 
-                if (hasExited()) return;
+        return {
+            kind: 'track',
+            id: randomUUID(),
+            title,
+            url: mediaUrl,
+            duration: data.duration ?? undefined,
+            thumbnail: normalizeHttpUrl(data.thumbnail),
+            requestedBy
+        };
+    }
 
-                ytProcess.kill('SIGTERM');
-                if (hasExited()) return;
+    private mapProcessError(error: unknown): TrackResolverError {
+        if (!(error instanceof YtDlpProcessError)) {
+            const cause = asError(error);
+            this.logProcessError(cause);
+            return new TrackResolverError(
+                'Track metadata process failed.',
+                'PROCESS_FAILURE',
+                { cause }
+            );
+        }
 
-                forceKillTimer = setTimeout(() => {
-                    forceKillTimer = undefined;
-                    if (!hasExited()) ytProcess.kill('SIGKILL');
-                }, this.forceKillTimeoutMs);
-                forceKillTimer.unref();
-            };
+        if (error.code === 'CANCELLED') return createCancellationError();
+        if (error.code === 'TIMEOUT') {
+            return new TrackResolverError('Track metadata lookup timed out.', 'TIMEOUT');
+        }
+        if (error.code === 'OUTPUT_LIMIT') {
+            return new TrackResolverError(
+                'Track metadata response exceeded the configured size limit.',
+                'OUTPUT_LIMIT'
+            );
+        }
 
-            const handleAbort = () => {
-                rejectAndStop(createCancellationError());
-            };
+        if (error.code === 'PROCESS_FAILURE') {
+            this.logYtDlpFailure(error.message, error.stderr);
+            return new TrackResolverError(
+                'Failed to fetch track metadata.',
+                'PROCESS_FAILURE',
+                { cause: error }
+            );
+        }
 
-            const clearSettlementHandlers = () => {
-                if (deadlineTimer) {
-                    clearTimeout(deadlineTimer);
-                    deadlineTimer = undefined;
-                }
-                signal?.removeEventListener('abort', handleAbort);
-            };
-
-            const rejectOnce = (error: Error) => {
-                if (settled) return;
-                settled = true;
-                clearSettlementHandlers();
-                reject(error);
-            };
-
-            const rejectAndStop = (error: Error) => {
-                if (settled) return;
-                rejectOnce(error);
-                stopProcess();
-            };
-
-            const resolveOnce = (metadata: TrackMetadata) => {
-                if (settled) return;
-                settled = true;
-                clearSettlementHandlers();
-                resolve(metadata);
-            };
-
-            ytProcess.stdout.on('data', (chunk: Buffer) => {
-                if (settled) return;
-
-                stdoutBytes += chunk.length;
-                if (stdoutBytes > this.maxStdoutBytes) {
-                    rejectAndStop(new TrackResolverError(
-                        'Track metadata response exceeded the configured size limit.',
-                        'OUTPUT_LIMIT'
-                    ));
-                    return;
-                }
-
-                stdoutChunks.push(chunk);
-            });
-            ytProcess.stderr.on('data', (chunk: Buffer) => {
-                if (settled) return;
-                stderrData = Buffer.concat([stderrData, chunk]).subarray(-MAX_STDERR_BYTES);
-            });
-
-            ytProcess.once('close', (code, closeSignal) => {
-                processClosed = true;
-                clearForceKillTimer();
-                if (settled) return;
-
-                if (code !== 0) {
-                    const outcome = code === null
-                        ? `yt-dlp was terminated by ${closeSignal ?? 'an unknown signal'}`
-                        : `yt-dlp exited with code ${code}`;
-                    this.logYtDlpFailure(outcome, stderrData);
-                    rejectOnce(new TrackResolverError(
-                        'Failed to fetch track metadata.',
-                        'PROCESS_FAILURE'
-                    ));
-                    return;
-                }
-
-                let data: unknown;
-                try {
-                    data = JSON.parse(Buffer.concat(stdoutChunks, stdoutBytes).toString('utf8'));
-                } catch (error) {
-                    const cause = asError(error);
-                    console.error('[yt-dlp Parse Error] Failed to parse metadata JSON.');
-                    rejectOnce(new TrackResolverError(
-                        'yt-dlp returned malformed metadata.',
-                        'INVALID_RESPONSE',
-                        { cause }
-                    ));
-                    return;
-                }
-
-                if (!isYtDlpMetadata(data)) {
-                    rejectOnce(new TrackResolverError(
-                        'yt-dlp returned incomplete track metadata.',
-                        'INVALID_RESPONSE'
-                    ));
-                    return;
-                }
-
-                const title = normalizeTrackTitle(data.title);
-                const mediaUrl = normalizeMediaUrl(data.webpage_url);
-                if (!title || !mediaUrl) {
-                    rejectOnce(new TrackResolverError(
-                        'yt-dlp returned unsafe track metadata.',
-                        'INVALID_RESPONSE'
-                    ));
-                    return;
-                }
-
-                resolveOnce({
-                    kind: 'track',
-                    id: randomUUID(),
-                    title,
-                    url: mediaUrl,
-                    duration: data.duration ?? undefined,
-                    thumbnail: normalizeHttpUrl(data.thumbnail),
-                    requestedBy
-                });
-            });
-
-            ytProcess.once('error', (error) => {
-                if (settled) return;
-                this.logProcessError(error);
-                rejectAndStop(new TrackResolverError(
-                    'Track metadata process failed.',
-                    'PROCESS_FAILURE',
-                    { cause: error }
-                ));
-            });
-
-            deadlineTimer = setTimeout(() => {
-                rejectAndStop(new TrackResolverError(
-                    'Track metadata lookup timed out.',
-                    'TIMEOUT'
-                ));
-            }, this.timeoutMs);
-            deadlineTimer.unref();
-
-            signal?.addEventListener('abort', handleAbort, { once: true });
-            if (signal?.aborted) handleAbort();
-        });
+        this.logProcessError(error.cause instanceof Error ? error.cause : error);
+        return new TrackResolverError(
+            'Track metadata process failed.',
+            'PROCESS_FAILURE',
+            { cause: error.cause ?? error }
+        );
     }
 
     private resolveInput(query: string): string {
@@ -388,7 +309,6 @@ export class TrackResolver {
 
     private createArguments(input: string): string[] {
         return [
-            ...this.ytDlpCommandArgs,
             '--ignore-config',
             '--dump-json',
             '--no-playlist',
