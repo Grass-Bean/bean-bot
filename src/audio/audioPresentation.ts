@@ -31,7 +31,7 @@ export const linkedTrackTitle = (track: TrackMetadata): string => (
 );
 
 const setTrackArtwork = (embed: EmbedBuilder, track: TrackMetadata): EmbedBuilder => {
-    if (track.thumbnail) embed.setThumbnail(track.thumbnail);
+    if (track.thumbnail) embed.setImage(track.thumbnail);
     return embed;
 };
 
@@ -45,13 +45,15 @@ export const createQueuedTrackEmbed = (
     if (duration) metadata.push(`\`${duration}\``);
     if (!startsImmediately) metadata.push(`Position ${position}`);
 
-    const embed = new EmbedBuilder()
-        .setColor(startsImmediately ? AUDIO_COLORS.success : AUDIO_COLORS.info)
-        .setAuthor({ name: startsImmediately ? 'Starting playback' : 'Added to queue' })
-        .setTitle(track.title)
-        .setURL(track.url);
+    const details = metadata.length ? `${metadata.join('  •  ')}\n` : '';
 
-    if (metadata.length) embed.setDescription(metadata.join(' · '));
+    const embed = new EmbedBuilder()
+        .setColor(AUDIO_COLORS.info)
+        .setAuthor({ name: '＋ Added to queue' })
+        .setTitle(track.title)
+        .setURL(track.url)
+        .setDescription(`${details}Requested by <@${track.requestedBy}>`);
+
     return setTrackArtwork(embed, track);
 };
 
@@ -64,13 +66,17 @@ export const createNowPlayingEmbed = (
     if (duration) details.push(`\`${duration}\``);
     details.push(`Requested by <@${track.requestedBy}>`);
 
-    const waitingLabel = tracksWaiting === 1 ? '1 track waiting' : `${tracksWaiting} tracks waiting`;
+    const waitingLabel = tracksWaiting === 0
+        ? 'Queue empty'
+        : tracksWaiting === 1
+            ? 'Up next: 1 track'
+            : `Up next: ${tracksWaiting} tracks`;
     const embed = new EmbedBuilder()
-        .setColor(AUDIO_COLORS.info)
-        .setAuthor({ name: 'Now playing' })
+        .setColor(AUDIO_COLORS.success)
+        .setAuthor({ name: '♫ Now playing' })
         .setTitle(track.title)
         .setURL(track.url)
-        .setDescription(details.join(' · '))
+        .setDescription(details.join('  •  '))
         .setFooter({ text: waitingLabel });
 
     return setTrackArtwork(embed, track);

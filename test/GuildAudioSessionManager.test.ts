@@ -77,6 +77,7 @@ const makeTrack = (id: string, duration?: number): TrackMetadata => ({
     title: `Track ${id}`,
     url: `https://youtube.com/watch?v=${id}`,
     duration,
+    thumbnail: `https://img.youtube.com/${id}.jpg`,
     requestedBy: 'user-a'
 });
 
@@ -230,8 +231,11 @@ describe('GuildAudioSessionManager', () => {
             metadata: expect.objectContaining({ id: 'one' })
         }));
         const nowPlaying = channel.send.mock.calls[0][0].embeds[0].toJSON();
-        expect(nowPlaying.author.name).toBe('Now playing');
+        expect(nowPlaying.author.name).toBe('♫ Now playing');
+        expect(nowPlaying.color).toBe(0x57f287);
         expect(nowPlaying.title).toBe('Track one');
+        expect(nowPlaying.image?.url).toBe('https://img.youtube.com/one.jpg');
+        expect(nowPlaying.thumbnail).toBeUndefined();
 
         expect(manager.enqueue('guild-a', makeTrack('two'), channel)).toEqual({
             accepted: true, startsImmediately: false, position: 1

@@ -57,10 +57,10 @@ export default {
         const generateEmbed = (page: number) => {
             const embed = new EmbedBuilder()
                 .setColor(currentTrack || pendingTracks.length ? AUDIO_COLORS.info : AUDIO_COLORS.neutral)
-                .setTitle('Audio queue');
+                .setTitle('♫ Audio queue');
 
             if (!currentTrack && pendingTracks.length === 0) {
-                embed.setDescription('Nothing is playing or queued.\nAdd something with `/play`.');
+                embed.setDescription('**Nothing playing yet**\nAdd a track with `/play`.');
             } else {
                 const sections: string[] = [];
                 if (currentTrack) {
@@ -68,7 +68,7 @@ export default {
                     const details = [duration ? `\`${duration}\`` : undefined, `Requested by <@${currentTrack.requestedBy}>`]
                         .filter(Boolean)
                         .join(' · ');
-                    sections.push(`**Now playing**\n▶ ${linkedTrackTitle(currentTrack)}\n${details}`);
+                    sections.push(`**▶ Now playing**\n${linkedTrackTitle(currentTrack)}\n${details}`);
                     if (currentTrack.thumbnail) embed.setThumbnail(currentTrack.thumbnail);
                 }
 

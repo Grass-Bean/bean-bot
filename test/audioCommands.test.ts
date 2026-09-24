@@ -46,6 +46,7 @@ const track = (id = 'track-a', title = 'Song *A*'): TrackMetadata => ({
     title,
     url: `https://youtube.com/watch?v=${id}`,
     duration: 65,
+    thumbnail: `https://img.youtube.com/${id}.jpg`,
     requestedBy: 'user-a'
 });
 
@@ -189,9 +190,13 @@ describe('audio commands', () => {
             expect(controllerMock.connect).toHaveBeenCalledWith(interaction, 'voice-a');
             expect(sessionsMock.enqueue).toHaveBeenCalledWith('guild-a', track(), interaction.channel);
             const embed = interaction.editReply.mock.calls[0][0].embeds[0].toJSON();
-            expect(embed.author.name).toBe('Starting playback');
+            expect(embed.author.name).toBe('＋ Added to queue');
+            expect(embed.color).toBe(0x5865f2);
             expect(embed.title).toBe('Song *A*');
             expect(embed.description).toContain('1:05');
+            expect(embed.description).not.toContain('Playing now');
+            expect(embed.image?.url).toBe('https://img.youtube.com/track-a.jpg');
+            expect(embed.thumbnail).toBeUndefined();
         });
 
         it('reports queued position and an enqueue race that fills the queue', async () => {
@@ -199,7 +204,7 @@ describe('audio commands', () => {
             const queued = createInteraction();
             await playCommand.execute(queued);
             const embed = queued.editReply.mock.calls[0][0].embeds[0].toJSON();
-            expect(embed.author.name).toBe('Added to queue');
+            expect(embed.author.name).toBe('＋ Added to queue');
             expect(embed.description).toContain('Position 4');
 
             sessionsMock.enqueue.mockReturnValueOnce({ accepted: false, startsImmediately: false, position: 50 });
@@ -251,7 +256,7 @@ describe('audio commands', () => {
             await queueCommand.execute(interaction);
 
             const payload = interaction.editReply.mock.calls[0][0];
-            expect(payload.embeds[0].toJSON().description).toContain('Nothing is playing or queued.');
+            expect(payload.embeds[0].toJSON().description).toContain('Nothing playing yet');
             expect(payload.components).toEqual([]);
         });
 
@@ -265,7 +270,7 @@ describe('audio commands', () => {
 
             expect(interaction.deferReply).not.toHaveBeenCalled();
             const description = interaction.editReply.mock.calls[0][0].embeds[0].toJSON().description;
-            expect(description).toContain('**Now playing**');
+            expect(description).toContain('**▶ Now playing**');
             expect(description).toContain('`1:01:01`');
             expect(description).toContain('%28b%29%5Cc');
         });
