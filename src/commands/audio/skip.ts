@@ -1,4 +1,9 @@
-import { SlashCommandBuilder, ChatInputCommandInteraction, MessageFlags } from 'discord.js';
+import {
+    SlashCommandBuilder,
+    ChatInputCommandInteraction,
+    MessageFlags,
+    escapeMarkdown
+} from 'discord.js';
 import { audioInteractionController } from '../../audio/AudioInteractionController.js';
 import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
 
@@ -9,12 +14,14 @@ export default {
     async execute(interaction: ChatInputCommandInteraction) {
         if (!await audioInteractionController.ensureCanControl(interaction)) return;
 
+        const current = guildAudioSessionManager.getSnapshot(interaction.guildId!).current;
         if (!guildAudioSessionManager.skip(interaction.guildId!)) {
             return interaction.reply({ 
-                content: "No audio track is currently playing.",
+                content: 'ℹ️ **Nothing is playing**\nAdd something with `/play`.',
                 flags: MessageFlags.Ephemeral 
             });
         }
-        await interaction.reply("Skipped the current track.");
+        const title = current?.kind === 'track' ? ` **${escapeMarkdown(current.title)}**` : '';
+        await interaction.reply(`⏭️ Skipped${title}.`);
     }
 }

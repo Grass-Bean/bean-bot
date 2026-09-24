@@ -229,9 +229,9 @@ describe('GuildAudioSessionManager', () => {
         expect(player.play).toHaveBeenCalledWith(expect.objectContaining({
             metadata: expect.objectContaining({ id: 'one' })
         }));
-        expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
-            content: expect.stringContaining('Now Playing')
-        }));
+        const nowPlaying = channel.send.mock.calls[0][0].embeds[0].toJSON();
+        expect(nowPlaying.author.name).toBe('Now playing');
+        expect(nowPlaying.title).toBe('Track one');
 
         expect(manager.enqueue('guild-a', makeTrack('two'), channel)).toEqual({
             accepted: true, startsImmediately: false, position: 1
@@ -343,7 +343,7 @@ describe('GuildAudioSessionManager', () => {
             metadata: expect.objectContaining({ id: 'good' })
         }));
         expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
-            content: expect.stringContaining('Could not play')
+            content: expect.stringContaining('Couldn’t play')
         }));
         expect(errorSpy).toHaveBeenCalled();
     });
@@ -478,7 +478,7 @@ describe('GuildAudioSessionManager', () => {
             expect.any(Error)
         );
         expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
-            content: expect.stringContaining('Voice connection was lost')
+            content: expect.stringContaining('Voice connection lost')
         }));
     });
 
@@ -499,7 +499,7 @@ describe('GuildAudioSessionManager', () => {
         await vi.waitFor(() => expect(manager.getActiveChannelId('guild-a')).toBeUndefined());
         expect(connection.destroy).toHaveBeenCalled();
         expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
-            content: expect.stringContaining('disconnected from the voice channel')
+            content: expect.stringContaining('Disconnected from voice')
         }));
     });
 
@@ -531,7 +531,7 @@ describe('GuildAudioSessionManager', () => {
         connection.state.networking.emit('close', 4022);
         expect(manager.getActiveChannelId('guild-a')).toBeUndefined();
         expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
-            content: expect.stringContaining('call ended')
+            content: expect.stringContaining('Voice call ended')
         }));
 
         connection = createConnection();
@@ -617,7 +617,7 @@ describe('GuildAudioSessionManager', () => {
 
         expect(manager.getActiveChannelId('guild-a')).toBeUndefined();
         expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
-            content: expect.stringContaining('Disconnected due to')
+            content: expect.stringContaining('Disconnected after')
         }));
     });
 
@@ -645,7 +645,7 @@ describe('GuildAudioSessionManager', () => {
         await vi.advanceTimersByTimeAsync(10);
         await flushTransitions();
         expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
-            content: expect.stringContaining('did not start in time')
+            content: expect.stringContaining('didn’t start in time')
         }));
         expect(resources.release).toHaveBeenCalledWith(expect.objectContaining({
             metadata: expect.objectContaining({ id: 'one' })
@@ -674,7 +674,7 @@ describe('GuildAudioSessionManager', () => {
 
         expect(player.stop).toHaveBeenCalledWith(true);
         expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
-            content: expect.stringContaining('playback stalled')
+            content: expect.stringContaining('Playback stalled')
         }));
         expect(resources.release).not.toHaveBeenCalledWith(resource);
 
@@ -708,7 +708,7 @@ describe('GuildAudioSessionManager', () => {
 
         expect(player.stop).toHaveBeenCalledWith(true);
         expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
-            content: expect.stringContaining('playback stalled')
+            content: expect.stringContaining('Playback stalled')
         }));
     });
 
@@ -737,7 +737,7 @@ describe('GuildAudioSessionManager', () => {
 
         expect(player.stop).toHaveBeenCalledWith(true);
         expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
-            content: expect.stringContaining('exceeded its expected playback time')
+            content: expect.stringContaining('longer than expected')
         }));
     });
 });

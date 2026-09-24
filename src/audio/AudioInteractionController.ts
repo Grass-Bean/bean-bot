@@ -20,7 +20,7 @@ export class AudioInteractionController {
         expectedChannelId?: string
     ): Promise<string | undefined> {
         if (!interaction.guild || !interaction.member) {
-            await this.respond(interaction, 'This command can only be used in a server.');
+            await this.respond(interaction, '❌ **Server only**\nUse this command in a server.');
             return undefined;
         }
 
@@ -31,20 +31,26 @@ export class AudioInteractionController {
                 : await interaction.guild.members.fetch(interaction.user.id);
         } catch (error) {
             console.error(`Failed to resolve member voice state in guild ${interaction.guild.id}:`, error);
-            await this.respond(interaction, 'Could not determine your voice channel.');
+            await this.respond(
+                interaction,
+                '⚠️ **Couldn’t check your voice channel**\nPlease try again.'
+            );
             return undefined;
         }
 
         const voiceChannelId = member.voice.channelId;
         if (!voiceChannelId) {
-            await this.respond(interaction, 'You need to be in a voice channel to use this command.');
+            await this.respond(
+                interaction,
+                '🔊 **Join a voice channel first**\nThen run the command again.'
+            );
             return undefined;
         }
 
         if (expectedChannelId && expectedChannelId !== voiceChannelId) {
             await this.respond(
                 interaction,
-                'Your voice channel changed while the command was running. Please try again.'
+                '⚠️ **Voice channel changed**\nRun the command again from your current channel.'
             );
             return undefined;
         }
@@ -53,7 +59,7 @@ export class AudioInteractionController {
         if (activeChannelId && activeChannelId !== voiceChannelId) {
             await this.respond(
                 interaction,
-                `The bot is already active in <#${activeChannelId}>. Join that voice channel to control it.`
+                `ℹ️ **I’m active in <#${activeChannelId}>**\nJoin that channel to control playback.`
             );
             return undefined;
         }
@@ -79,13 +85,16 @@ export class AudioInteractionController {
                 const retryAfterSeconds = Math.max(1, Math.ceil(error.retryAfterMs / 1_000));
                 await this.respond(
                     interaction,
-                    `Discord temporarily rate-limited voice connections. Please try again in ${retryAfterSeconds} seconds.`
+                    `⚠️ **Voice is temporarily rate-limited**\nTry again in ${retryAfterSeconds} seconds.`
                 );
                 return undefined;
             }
 
             console.error(`Failed to connect to voice in guild ${interaction.guild.id}:`, error);
-            await this.respond(interaction, 'Failed to connect to the voice channel.');
+            await this.respond(
+                interaction,
+                '❌ **Couldn’t join the voice channel**\nCheck my Connect and Speak permissions, then try again.'
+            );
             return undefined;
         }
     }

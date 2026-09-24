@@ -14,7 +14,7 @@ export default {
         const connection = await audioInteractionController.connect(interaction, voiceChannelId);
         if (connection) {
             await interaction.editReply({
-                content: 'Connected to voice channel! 🔊',
+                content: `🔊 Connected to <#${voiceChannelId}>.`,
                 allowedMentions: { parse: [] }
             });
         }

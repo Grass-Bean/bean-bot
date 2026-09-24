@@ -69,7 +69,7 @@ const createInteraction = (overrides: Record<string, unknown> = {}) => ({
 
 describe('audio commands', () => {
     beforeEach(() => {
-        vi.clearAllMocks();
+        vi.resetAllMocks();
         controllerMock.requireVoiceChannel.mockResolvedValue('voice-a');
         controllerMock.connect.mockResolvedValue({ id: 'connection-a' });
         controllerMock.ensureCanControl.mockResolvedValue(true);
@@ -110,7 +110,7 @@ describe('audio commands', () => {
             const interaction = createInteraction({ guild: null, member: null });
             await disconnectCommand.execute(interaction);
             expect(interaction.reply).toHaveBeenCalledWith(expect.objectContaining({
-                content: 'This command can only be used in a server.',
+                content: '❌ **Server only**\nUse this command in a server.',
                 flags: MessageFlags.Ephemeral
             }));
         });
@@ -124,12 +124,12 @@ describe('audio commands', () => {
             sessionsMock.disconnect.mockReturnValueOnce(true).mockReturnValueOnce(false);
             const disconnected = createInteraction();
             await disconnectCommand.execute(disconnected);
-            expect(disconnected.reply).toHaveBeenCalledWith({ content: 'Disconnected from the voice channel!' });
+            expect(disconnected.reply).toHaveBeenCalledWith({ content: '🔌 Disconnected from the voice channel.' });
 
             const absent = createInteraction();
             await disconnectCommand.execute(absent);
             expect(absent.reply).toHaveBeenCalledWith(expect.objectContaining({
-                content: 'The bot is not connected to a voice channel.'
+                content: expect.stringContaining('Nothing to disconnect')
             }));
         });
 
@@ -139,7 +139,7 @@ describe('audio commands', () => {
             const interaction = createInteraction();
             await disconnectCommand.execute(interaction);
             expect(interaction.reply).toHaveBeenCalledWith(expect.objectContaining({
-                content: 'Failed to disconnect from the voice channel.'
+                content: expect.stringContaining('Couldn’t disconnect')
             }));
         });
 
@@ -153,12 +153,13 @@ describe('audio commands', () => {
             const empty = createInteraction();
             await skipCommand.execute(empty);
             expect(empty.reply).toHaveBeenCalledWith(expect.objectContaining({
-                content: 'No audio track is currently playing.'
+                content: expect.stringContaining('Nothing is playing')
             }));
 
+            sessionsMock.getSnapshot.mockReturnValueOnce({ current: track(), pending: [] });
             const playing = createInteraction();
             await skipCommand.execute(playing);
-            expect(playing.reply).toHaveBeenCalledWith('Skipped the current track.');
+            expect(playing.reply).toHaveBeenCalledWith(expect.stringContaining('Song \\*A\\*'));
         });
     });
 
@@ -176,7 +177,7 @@ describe('audio commands', () => {
             await playCommand.execute(interaction);
             expect(interaction.deferReply).toHaveBeenCalled();
             expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({
-                content: expect.stringContaining('queue is full')
+                content: expect.stringContaining('Queue is full')
             }));
             expect(resolverMock.resolve).not.toHaveBeenCalled();
         });
@@ -187,24 +188,25 @@ describe('audio commands', () => {
             expect(resolverMock.resolve).toHaveBeenCalledWith('song query', 'user-a');
             expect(controllerMock.connect).toHaveBeenCalledWith(interaction, 'voice-a');
             expect(sessionsMock.enqueue).toHaveBeenCalledWith('guild-a', track(), interaction.channel);
-            expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({
-                content: expect.stringContaining('Song \\*A\\*')
-            }));
+            const embed = interaction.editReply.mock.calls[0][0].embeds[0].toJSON();
+            expect(embed.author.name).toBe('Starting playback');
+            expect(embed.title).toBe('Song *A*');
+            expect(embed.description).toContain('1:05');
         });
 
         it('reports queued position and an enqueue race that fills the queue', async () => {
             sessionsMock.enqueue.mockReturnValueOnce({ accepted: true, startsImmediately: false, position: 4 });
             const queued = createInteraction();
             await playCommand.execute(queued);
-            expect(queued.editReply).toHaveBeenCalledWith(expect.objectContaining({
-                content: expect.stringContaining('Position: 4')
-            }));
+            const embed = queued.editReply.mock.calls[0][0].embeds[0].toJSON();
+            expect(embed.author.name).toBe('Added to queue');
+            expect(embed.description).toContain('Position 4');
 
             sessionsMock.enqueue.mockReturnValueOnce({ accepted: false, startsImmediately: false, position: 50 });
             const full = createInteraction();
             await playCommand.execute(full);
             expect(full.editReply).toHaveBeenCalledWith(expect.objectContaining({
-                content: expect.stringContaining('queue is full')
+                content: expect.stringContaining('Queue is full')
             }));
         });
 
@@ -220,13 +222,15 @@ describe('audio commands', () => {
             ['UNSUPPORTED_URL', 'bad host', 'bad host'],
             ['TIMEOUT', 'timeout', 'The media lookup timed out. Please try again.'],
             ['CANCELLED', 'cancelled', 'The media lookup was cancelled.'],
-            ['PROCESS_FAILURE', 'failed', 'Failed to find or inspect the requested media.']
+            ['PROCESS_FAILURE', 'failed', 'Try another song name or paste a supported media link.']
         ] as const)('maps resolver error %s to a safe reply', async (code, sourceMessage, response) => {
             vi.spyOn(console, 'error').mockImplementation(() => undefined);
             resolverMock.resolve.mockRejectedValue(new TrackResolverError(sourceMessage, code));
             const interaction = createInteraction();
             await playCommand.execute(interaction);
-            expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({ content: response }));
+            expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({
+                content: expect.stringContaining(response)
+            }));
         });
 
         it('maps unexpected errors to a generic reply', async () => {
@@ -235,7 +239,7 @@ describe('audio commands', () => {
             const interaction = createInteraction();
             await playCommand.execute(interaction);
             expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({
-                content: 'Failed to find or play the requested media.'
+                content: expect.stringContaining('Failed to find or play the requested media.')
             }));
         });
     });
@@ -247,7 +251,7 @@ describe('audio commands', () => {
             await queueCommand.execute(interaction);
 
             const payload = interaction.editReply.mock.calls[0][0];
-            expect(payload.embeds[0].toJSON().description).toBe('The queue is currently empty.');
+            expect(payload.embeds[0].toJSON().description).toContain('Nothing is playing or queued.');
             expect(payload.components).toEqual([]);
         });
 
@@ -261,8 +265,8 @@ describe('audio commands', () => {
 
             expect(interaction.deferReply).not.toHaveBeenCalled();
             const description = interaction.editReply.mock.calls[0][0].embeds[0].toJSON().description;
-            expect(description).toContain('(Now Playing)');
-            expect(description).toContain('`[1:01:01]`');
+            expect(description).toContain('**Now playing**');
+            expect(description).toContain('`1:01:01`');
             expect(description).toContain('%28b%29%5Cc');
         });
 

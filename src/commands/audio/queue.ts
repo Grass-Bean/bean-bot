@@ -7,24 +7,14 @@ import {
     ButtonStyle,
     ButtonInteraction,
     ComponentType,
-    escapeMarkdown
 } from 'discord.js';
 import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
 import type { TrackMetadata } from '../../audio/types.js';
-
-const formatDuration = (durationSeconds: number | undefined): string => {
-    if (durationSeconds === undefined) return '';
-
-    const totalSeconds = Math.floor(durationSeconds);
-    const hours = Math.floor(totalSeconds / 3_600);
-    const minutes = Math.floor((totalSeconds % 3_600) / 60);
-    const seconds = totalSeconds % 60;
-    const formatted = hours > 0
-        ? `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
-        : `${minutes}:${seconds.toString().padStart(2, '0')}`;
-
-    return ` \`[${formatted}]\``;
-};
+import {
+    AUDIO_COLORS,
+    formatDuration,
+    linkedTrackTitle
+} from '../../audio/audioPresentation.js';
 
 export default {
     data: new SlashCommandBuilder()
@@ -37,16 +27,16 @@ export default {
 
         const snapshot = guildAudioSessionManager.getSnapshot(interaction.guildId!);
         const currentTrack = snapshot.current?.kind === 'track' ? snapshot.current : undefined;
-        const allItems = currentTrack ? [currentTrack, ...snapshot.pending] : [...snapshot.pending];
+        const pendingTracks = [...snapshot.pending];
 
         const maxItemsPerPage = 10;
-        const maxDescriptionLength = 3_900;
-        const lines = allItems.map((item: TrackMetadata, index: number) => {
+        const maxDescriptionLength = currentTrack ? 3_100 : 3_700;
+        const lines = pendingTracks.map((item: TrackMetadata, index: number) => {
             const duration = formatDuration(item.duration);
-            const status = currentTrack?.id === item.id ? ' **(Now Playing)**' : '';
-            const safeTitle = escapeMarkdown(item.title);
-            const safeUrl = item.url.replace(/\\/g, '%5C').replace(/\(/g, '%28').replace(/\)/g, '%29');
-            return `**${index + 1}.** [${safeTitle}](${safeUrl})${duration} • <@${item.requestedBy}>${status}`;
+            const metadata = [duration ? `\`${duration}\`` : undefined, `<@${item.requestedBy}>`]
+                .filter(Boolean)
+                .join(' · ');
+            return `\`${index + 1}\` ${linkedTrackTitle(item)}\n　 ${metadata}`;
         });
         const pages: string[][] = [[]];
 
@@ -66,16 +56,33 @@ export default {
         // --- Helper: Generate Embed ---
         const generateEmbed = (page: number) => {
             const embed = new EmbedBuilder()
-                .setColor(0x00ff00)
-                .setTitle("Current Audio Queue");
+                .setColor(currentTrack || pendingTracks.length ? AUDIO_COLORS.info : AUDIO_COLORS.neutral)
+                .setTitle('Audio queue');
 
-            if (allItems.length === 0) {
-                embed.setDescription("The queue is currently empty.");
-                embed.setFooter({ text: "Page 1 of 1" });
+            if (!currentTrack && pendingTracks.length === 0) {
+                embed.setDescription('Nothing is playing or queued.\nAdd something with `/play`.');
             } else {
-                embed.setDescription(pages[page].join('\n'));
-                embed.setFooter({ text: `Page ${page + 1} of ${totalPages} • Total tracks: ${allItems.length}` });
-                embed.setTimestamp();
+                const sections: string[] = [];
+                if (currentTrack) {
+                    const duration = formatDuration(currentTrack.duration);
+                    const details = [duration ? `\`${duration}\`` : undefined, `Requested by <@${currentTrack.requestedBy}>`]
+                        .filter(Boolean)
+                        .join(' · ');
+                    sections.push(`**Now playing**\n▶ ${linkedTrackTitle(currentTrack)}\n${details}`);
+                    if (currentTrack.thumbnail) embed.setThumbnail(currentTrack.thumbnail);
+                }
+
+                const upcoming = pages[page].length
+                    ? pages[page].join('\n')
+                    : '*Nothing else queued.*';
+                sections.push(`**Up next**\n${upcoming}`);
+                embed.setDescription(sections.join('\n\n'));
+
+                const waiting = pendingTracks.length === 1
+                    ? '1 track waiting'
+                    : `${pendingTracks.length} tracks waiting`;
+                const pageLabel = totalPages > 1 ? ` · Page ${page + 1} of ${totalPages}` : '';
+                embed.setFooter({ text: `${waiting}${pageLabel}` });
             }
 
             return embed;
@@ -87,13 +94,13 @@ export default {
                 .addComponents(
                     new ButtonBuilder()
                         .setCustomId('prev')
-                        .setLabel('◀ Previous')
-                        .setStyle(ButtonStyle.Primary)
+                        .setLabel('← Previous')
+                        .setStyle(ButtonStyle.Secondary)
                         .setDisabled(page === 0), // Disable if on first page
                     new ButtonBuilder()
                         .setCustomId('next')
-                        .setLabel('Next ▶')
-                        .setStyle(ButtonStyle.Primary)
+                        .setLabel('Next →')
+                        .setStyle(ButtonStyle.Secondary)
                         .setDisabled(page >= totalPages - 1) // Disable if on last page
                 );
             

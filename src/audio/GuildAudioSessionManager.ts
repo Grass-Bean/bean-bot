@@ -9,9 +9,10 @@ import {
     VoiceConnectionDisconnectReason,
     VoiceConnectionStatus
 } from '@discordjs/voice';
-import { escapeMarkdown, TextChannel } from 'discord.js';
+import { escapeMarkdown, TextChannel, type MessageCreateOptions } from 'discord.js';
 import { Deque, MAX_QUEUE_SIZE } from './Deque.js';
 import { audioResourceManager, AudioResourceManager } from './AudioResourceManager.js';
+import { createNowPlayingEmbed } from './audioPresentation.js';
 import type {
     AudioMetadata,
     AudioQueueSnapshot,
@@ -132,7 +133,10 @@ export class GuildAudioSessionManager {
             const metadata = error.resource.metadata as AudioMetadata | null;
             console.error(`Audio player error in guild ${guildId} (${metadata?.title ?? 'unknown resource'}):`, error);
             if (metadata?.kind === 'track') {
-                this.notify(session, `⚠️ Could not play **${escapeMarkdown(metadata.title)}**. Skipping...`);
+                this.notify(
+                    session,
+                    `⚠️ **Couldn’t play ${escapeMarkdown(metadata.title)}**\nSkipping to the next track.`
+                );
             }
         });
 
@@ -358,11 +362,11 @@ export class GuildAudioSessionManager {
                     );
                     this.notify(
                         session,
-                        'ℹ️ The bot was disconnected from the voice channel. The audio session has been cleared.'
+                        'ℹ️ **Disconnected from voice**\nThe audio session was cleared.'
                     );
                 } else {
                     console.error(`Voice connection recovery failed in guild ${session.guildId}:`, error);
-                    this.notify(session, '⚠️ Voice connection was lost. Disconnecting the audio session.');
+                    this.notify(session, '⚠️ **Voice connection lost**\nThe audio session was cleared.');
                 }
                 this.closeSession(session, true);
             } finally {
@@ -398,8 +402,8 @@ export class GuildAudioSessionManager {
             if (code === 4021) this.startRateLimitCooldown(session.guildId);
 
             const notification = code === 4021
-                ? '⚠️ Discord disconnected the bot for voice rate limiting. The audio session has been cleared.'
-                : 'ℹ️ The voice call ended or became unavailable. The audio session has been cleared.';
+                ? '⚠️ **Discord rate-limited voice**\nThe audio session was cleared.'
+                : 'ℹ️ **Voice call ended**\nThe audio session was cleared.';
             this.notify(session, notification);
             this.closeSession(session, true);
         });
@@ -482,16 +486,18 @@ export class GuildAudioSessionManager {
                 session.current = resource;
                 session.player.play(resource);
                 this.startTrackWatchdog(session, resource);
-                this.notify(
-                    session,
-                    `🎶 **Now Playing:** ${escapeMarkdown(resource.metadata.title)}\n🔗 ${resource.metadata.kind === 'track' ? resource.metadata.url : ''}`
-                );
+                this.notify(session, {
+                    embeds: [createNowPlayingEmbed(track, session.queue.size())]
+                });
                 this.reconcilePreload(session);
                 return;
             } catch (error) {
                 console.error(`Failed to play ${track.title} in guild ${session.guildId}:`, error);
                 this.releaseCurrent(session);
-                this.notify(session, `⚠️ Could not play **${escapeMarkdown(track.title)}**. Skipping...`);
+                this.notify(
+                    session,
+                    `⚠️ **Couldn’t play ${escapeMarkdown(track.title)}**\nSkipping to the next track.`
+                );
             }
         }
     }
@@ -556,11 +562,14 @@ export class GuildAudioSessionManager {
         }
 
         if (!session.inactivityTimer) {
-            this.notify(session, '**Queue finished.** Disconnecting in 5 minutes...');
+            this.notify(
+                session,
+                '⏱️ **Queue finished**\nDisconnecting in 5 minutes if nothing else is added.'
+            );
             this.scheduleInactivityDisconnect(
                 session,
                 this.inactivityTimeoutMs,
-                '**Disconnected due to 5 minutes of inactivity.**'
+                '🔌 **Disconnected after 5 minutes of inactivity.**'
             );
         }
     }
@@ -609,9 +618,9 @@ export class GuildAudioSessionManager {
             const now = Date.now();
             if (session.player.state.status !== AudioPlayerStatus.Playing) {
                 if (!playbackStartedAt && now - startedAt >= this.trackStartupTimeoutMs) {
-                    this.stopWatchedTrack(session, resource, '⚠️ Audio did not start in time. Skipping...');
+                    this.stopWatchedTrack(session, resource, 'Playback didn’t start in time');
                 } else if (playbackStartedAt && now - lastProgressAt >= this.trackStallTimeoutMs) {
-                    this.stopWatchedTrack(session, resource, '⚠️ Audio playback stalled. Skipping...');
+                    this.stopWatchedTrack(session, resource, 'Playback stalled');
                 }
                 return;
             }
@@ -621,12 +630,12 @@ export class GuildAudioSessionManager {
                 lastPlaybackDuration = resource.playbackDuration;
                 lastProgressAt = now;
             } else if (now - lastProgressAt >= this.trackStallTimeoutMs) {
-                this.stopWatchedTrack(session, resource, '⚠️ Audio playback stalled. Skipping...');
+                this.stopWatchedTrack(session, resource, 'Playback stalled');
                 return;
             }
 
             if (maximumPlaybackMs !== undefined && now - playbackStartedAt >= maximumPlaybackMs) {
-                this.stopWatchedTrack(session, resource, '⚠️ Audio exceeded its expected playback time. Skipping...');
+                this.stopWatchedTrack(session, resource, 'Playback ran longer than expected');
             }
         }, this.trackWatchdogIntervalMs);
         watchdog.unref();
@@ -636,12 +645,15 @@ export class GuildAudioSessionManager {
     private stopWatchedTrack(
         session: GuildAudioSession,
         resource: BeanAudioResource,
-        message: string
+        reason: string
     ): void {
         if (session.closing || session.current !== resource) return;
 
         this.clearTrackWatchdog(session);
-        this.notify(session, message);
+        const title = resource.metadata.kind === 'track'
+            ? ` **${escapeMarkdown(resource.metadata.title)}**`
+            : '';
+        this.notify(session, `⚠️ **${reason}**\nSkipped${title}.`);
         if (session.player.stop(true)) return;
 
         void this.schedule(session, async () => {
@@ -667,11 +679,12 @@ export class GuildAudioSessionManager {
         session.trackWatchdog = undefined;
     }
 
-    private notify(session: GuildAudioSession, message: string): void {
-        void session.announcementChannel?.send({
-            content: message,
-            allowedMentions: { parse: [] }
-        }).catch((error) => {
+    private notify(session: GuildAudioSession, message: string | MessageCreateOptions): void {
+        const payload: MessageCreateOptions = typeof message === 'string'
+            ? { content: message, allowedMentions: { parse: [] } }
+            : { ...message, allowedMentions: { parse: [] } };
+
+        void session.announcementChannel?.send(payload).catch((error) => {
             console.error(`Failed to send audio notification in guild ${session.guildId}:`, error);
         });
     }

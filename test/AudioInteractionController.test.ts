@@ -46,20 +46,20 @@ describe('AudioInteractionController', () => {
         const fresh = createInteraction({ guild: null, member: null });
         expect(await controller.requireVoiceChannel(fresh)).toBeUndefined();
         expect(fresh.reply).toHaveBeenCalledWith(expect.objectContaining({
-            content: 'This command can only be used in a server.',
+            content: '❌ **Server only**\nUse this command in a server.',
             flags: MessageFlags.Ephemeral
         }));
 
         const deferred = createInteraction({ guild: null, member: null, deferred: true });
         await controller.requireVoiceChannel(deferred);
         expect(deferred.editReply).toHaveBeenCalledWith(expect.objectContaining({
-            content: 'This command can only be used in a server.'
+            content: '❌ **Server only**\nUse this command in a server.'
         }));
 
         const replied = createInteraction({ guild: null, member: null, replied: true });
         await controller.requireVoiceChannel(replied);
         expect(replied.followUp).toHaveBeenCalledWith(expect.objectContaining({
-            content: 'This command can only be used in a server.',
+            content: '❌ **Server only**\nUse this command in a server.',
             flags: MessageFlags.Ephemeral
         }));
     });
@@ -71,7 +71,7 @@ describe('AudioInteractionController', () => {
 
         expect(await controller.requireVoiceChannel(failed)).toBeUndefined();
         expect(failed.reply).toHaveBeenCalledWith(expect.objectContaining({
-            content: 'Could not determine your voice channel.'
+            content: expect.stringContaining('Couldn’t check your voice channel')
         }));
         expect(errorSpy).toHaveBeenCalled();
 
@@ -79,7 +79,7 @@ describe('AudioInteractionController', () => {
         noVoice.guild.members.fetch.mockResolvedValueOnce({ voice: { channelId: null } });
         expect(await controller.requireVoiceChannel(noVoice)).toBeUndefined();
         expect(noVoice.reply).toHaveBeenCalledWith(expect.objectContaining({
-            content: 'You need to be in a voice channel to use this command.'
+            content: expect.stringContaining('Join a voice channel first')
         }));
     });
 
@@ -87,7 +87,7 @@ describe('AudioInteractionController', () => {
         const changed = createInteraction();
         expect(await controller.requireVoiceChannel(changed, 'voice-old')).toBeUndefined();
         expect(changed.reply).toHaveBeenCalledWith(expect.objectContaining({
-            content: 'Your voice channel changed while the command was running. Please try again.'
+            content: expect.stringContaining('Voice channel changed')
         }));
 
         sessions.getActiveChannelId.mockReturnValueOnce('voice-b');
@@ -125,7 +125,7 @@ describe('AudioInteractionController', () => {
 
         expect(await controller.connect(interaction)).toBeUndefined();
         expect(interaction.reply).toHaveBeenCalledWith(expect.objectContaining({
-            content: 'Discord temporarily rate-limited voice connections. Please try again in 2 seconds.'
+            content: expect.stringContaining('Try again in 2 seconds')
         }));
     });
 
@@ -136,7 +136,7 @@ describe('AudioInteractionController', () => {
 
         expect(await controller.connect(interaction)).toBeUndefined();
         expect(interaction.reply).toHaveBeenCalledWith(expect.objectContaining({
-            content: 'Failed to connect to the voice channel.'
+            content: expect.stringContaining('Couldn’t join the voice channel')
         }));
         expect(errorSpy).toHaveBeenCalled();
     });
