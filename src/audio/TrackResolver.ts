@@ -104,6 +104,33 @@ const normalizeMediaUrl = (value: string): string | undefined => {
     return normalized;
 };
 
+const getYouTubeVideoId = (value: string): string | undefined => {
+    try {
+        const url = new URL(value);
+        const hostname = url.hostname.toLowerCase();
+        if (hostname === 'youtu.be') {
+            return url.pathname.split('/').filter(Boolean)[0];
+        }
+        if (
+            hostname === 'youtube.com' || hostname.endsWith('.youtube.com') ||
+            hostname === 'youtube-nocookie.com' || hostname.endsWith('.youtube-nocookie.com')
+        ) {
+            return url.searchParams.get('v') ?? undefined;
+        }
+    } catch {
+        return undefined;
+    }
+
+    return undefined;
+};
+
+const getYouTubeThumbnail = (mediaUrl: string): string | undefined => {
+    const videoId = getYouTubeVideoId(mediaUrl);
+    return videoId
+        ? `https://i.ytimg.com/vi/${encodeURIComponent(videoId)}/hqdefault.jpg`
+        : undefined;
+};
+
 const normalizeTrackTitle = (value: string): string | undefined => {
     const normalized = value
         .replace(/[\u0000-\u001F\u007F-\u009F]+/g, ' ')
@@ -245,7 +272,7 @@ export class TrackResolver {
                 title,
                 url: mediaUrl,
                 duration: candidate.duration ?? undefined,
-                thumbnail: normalizeHttpUrl(candidate.thumbnail),
+                thumbnail: normalizeHttpUrl(candidate.thumbnail) ?? getYouTubeThumbnail(mediaUrl),
                 requestedBy: seed.requestedBy,
                 autoplay: true
             };
@@ -360,22 +387,10 @@ export class TrackResolver {
     }
 
     private createAutoplayInput(seed: TrackMetadata): string {
-        try {
-            const url = new URL(seed.url);
-            const hostname = url.hostname.toLowerCase();
-            const videoId = hostname === 'youtu.be'
-                ? url.pathname.split('/').filter(Boolean)[0]
-                : hostname === 'youtube.com' || hostname.endsWith('.youtube.com') ||
-                    hostname === 'youtube-nocookie.com' || hostname.endsWith('.youtube-nocookie.com')
-                    ? url.searchParams.get('v') ?? undefined
-                    : undefined;
-
-            if (videoId) {
-                const encodedId = encodeURIComponent(videoId);
-                return `https://www.youtube.com/watch?v=${encodedId}&list=RD${encodedId}`;
-            }
-        } catch {
-            // Track URLs are already validated, but title search remains a safe fallback.
+        const videoId = getYouTubeVideoId(seed.url);
+        if (videoId) {
+            const encodedId = encodeURIComponent(videoId);
+            return `https://www.youtube.com/watch?v=${encodedId}&list=RD${encodedId}`;
         }
 
         return `ytsearch10:${seed.title} official audio`;

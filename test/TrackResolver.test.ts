@@ -106,7 +106,8 @@ describe('TrackResolver', () => {
                 metadata(),
                 metadata({
                     title: 'Related Song',
-                    webpage_url: 'https://www.youtube.com/watch?v=related'
+                    webpage_url: 'https://www.youtube.com/watch?v=related',
+                    thumbnail: null
                 })
             ].map(item => JSON.stringify(item)).join('\n')
         ));
@@ -123,6 +124,7 @@ describe('TrackResolver', () => {
             kind: 'track',
             title: 'Related Song',
             url: 'https://www.youtube.com/watch?v=related',
+            thumbnail: 'https://i.ytimg.com/vi/related/hqdefault.jpg',
             requestedBy: 'user-a',
             autoplay: true
         });
