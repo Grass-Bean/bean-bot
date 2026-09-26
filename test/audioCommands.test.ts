@@ -13,7 +13,9 @@ const { controllerMock, sessionsMock, resolverMock } = vi.hoisted(() => ({
         skip: vi.fn(),
         isQueueFull: vi.fn(),
         enqueue: vi.fn(),
-        getSnapshot: vi.fn()
+        getSnapshot: vi.fn(),
+        isAutoplayEnabled: vi.fn(),
+        setAutoplay: vi.fn()
     },
     resolverMock: {
         resolve: vi.fn()
@@ -37,6 +39,7 @@ import disconnectCommand from '../src/commands/audio/disconnect.js';
 import skipCommand from '../src/commands/audio/skip.js';
 import playCommand from '../src/commands/audio/play.js';
 import queueCommand from '../src/commands/audio/queue.js';
+import autoplayCommand from '../src/commands/audio/autoplay.js';
 import { TrackResolverError } from '../src/audio/TrackResolver.js';
 import type { TrackMetadata } from '../src/audio/types.js';
 
@@ -59,7 +62,8 @@ const createInteraction = (overrides: Record<string, unknown> = {}) => ({
     deferred: false,
     replied: false,
     options: {
-        getString: vi.fn().mockReturnValue('song query')
+        getString: vi.fn().mockReturnValue('song query'),
+        getBoolean: vi.fn().mockReturnValue(null)
     },
     deferReply: vi.fn().mockResolvedValue(undefined),
     reply: vi.fn().mockResolvedValue(undefined),
@@ -77,6 +81,8 @@ describe('audio commands', () => {
         sessionsMock.isQueueFull.mockReturnValue(false);
         sessionsMock.enqueue.mockReturnValue({ accepted: true, startsImmediately: true, position: 0 });
         sessionsMock.getSnapshot.mockReturnValue({ pending: [] });
+        sessionsMock.isAutoplayEnabled.mockReturnValue(false);
+        sessionsMock.setAutoplay.mockReturnValue(true);
         resolverMock.resolve.mockResolvedValue(track());
     });
 
@@ -245,6 +251,31 @@ describe('audio commands', () => {
             await playCommand.execute(interaction);
             expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({
                 content: expect.stringContaining('Failed to find or play the requested media.')
+            }));
+        });
+    });
+
+    describe('/autoplay', () => {
+        it('connects and toggles autoplay with an ephemeral response', async () => {
+            const interaction = createInteraction();
+            await autoplayCommand.execute(interaction);
+
+            expect(interaction.deferReply).toHaveBeenCalledWith({ flags: MessageFlags.Ephemeral });
+            expect(controllerMock.connect).toHaveBeenCalledWith(interaction, 'voice-a');
+            expect(sessionsMock.setAutoplay).toHaveBeenCalledWith('guild-a', true);
+            expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({
+                content: expect.stringContaining('Autoplay on')
+            }));
+        });
+
+        it('honors an explicit off setting', async () => {
+            const interaction = createInteraction();
+            interaction.options.getBoolean.mockReturnValue(false);
+            await autoplayCommand.execute(interaction);
+
+            expect(sessionsMock.setAutoplay).toHaveBeenCalledWith('guild-a', false);
+            expect(interaction.editReply).toHaveBeenCalledWith(expect.objectContaining({
+                content: expect.stringContaining('Autoplay off')
             }));
         });
     });

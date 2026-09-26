@@ -100,6 +100,60 @@ describe('TrackResolver', () => {
         expect(vi.mocked(processes.collect).mock.calls[0]![0]).toContain('https://youtu.be/abc');
     });
 
+    it('resolves autoplay from a YouTube mix and skips the seed track', async () => {
+        vi.mocked(processes.collect).mockResolvedValue(collected(
+            [
+                metadata(),
+                metadata({
+                    title: 'Related Song',
+                    webpage_url: 'https://www.youtube.com/watch?v=related'
+                })
+            ].map(item => JSON.stringify(item)).join('\n')
+        ));
+        const resolver = new TrackResolver({}, processes);
+        const seed: TrackMetadata = {
+            kind: 'track',
+            id: 'seed',
+            title: 'A Song',
+            url: 'https://www.youtube.com/watch?v=abc',
+            requestedBy: 'user-a'
+        };
+
+        await expect(resolver.resolveAutoplay(seed)).resolves.toMatchObject({
+            kind: 'track',
+            title: 'Related Song',
+            url: 'https://www.youtube.com/watch?v=related',
+            requestedBy: 'user-a',
+            autoplay: true
+        });
+        expect(processes.collect).toHaveBeenCalledWith(
+            [
+                '--ignore-config', '--flat-playlist', '--playlist-end', '10', '--quiet',
+                '--print', '%(.{title,webpage_url,duration,thumbnail})j', '--',
+                'https://www.youtube.com/watch?v=abc&list=RDabc'
+            ],
+            {
+                signal: undefined,
+                timeoutMs: 15_000,
+                maxStdoutBytes: 1_000_000
+            }
+        );
+    });
+
+    it('reports when autoplay has no usable recommendation', async () => {
+        vi.mocked(processes.collect).mockResolvedValue(collected(metadata()));
+        const seed: TrackMetadata = {
+            kind: 'track',
+            id: 'seed',
+            title: 'A Song',
+            url: 'https://www.youtube.com/watch?v=abc',
+            requestedBy: 'user-a'
+        };
+
+        await expect(new TrackResolver({}, processes).resolveAutoplay(seed))
+            .rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+    });
+
     it.each([
         ['not json', 'yt-dlp returned malformed metadata.'],
         [JSON.stringify({ title: '', webpage_url: 'https://youtube.com/a' }), 'yt-dlp returned incomplete track metadata.'],

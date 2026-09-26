@@ -15,6 +15,7 @@ export interface TrackMetadata {
     duration?: number;
     thumbnail?: string;
     requestedBy: string;
+    autoplay?: boolean;
 }
 
 export interface ElevatorMetadata {
@@ -62,9 +63,16 @@ export interface GuildAudioSession {
     trackWatchdog?: NodeJS.Timeout;
     announcementChannel: TextChannel | null;
     transition: Promise<void>;
+    autoplayEnabled: boolean;
+    lastTrack?: TrackMetadata;
+    autoplayController?: AbortController;
     recovery?: VoiceRecovery;
     hasBeenReady: boolean;
     closing: boolean;
+}
+
+export interface AutoplayTrackResolver {
+    resolveAutoplay(seed: TrackMetadata, signal?: AbortSignal): Promise<TrackMetadata>;
 }
 
 export interface YtDlpMetadata {

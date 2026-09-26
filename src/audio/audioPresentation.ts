@@ -64,10 +64,10 @@ export const createNowPlayingEmbed = (
     const details: string[] = [];
     const duration = formatDuration(track.duration);
     if (duration) details.push(`\`${duration}\``);
-    details.push(`Requested by <@${track.requestedBy}>`);
+    details.push(track.autoplay ? 'Autoplay' : `Requested by <@${track.requestedBy}>`);
 
     const waitingLabel = tracksWaiting === 0
-        ? 'Queue empty'
+        ? track.autoplay ? 'Autoplay' : 'Queue empty'
         : tracksWaiting === 1
             ? 'Up next: 1 track'
             : `Up next: ${tracksWaiting} tracks`;

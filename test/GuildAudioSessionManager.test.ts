@@ -28,7 +28,11 @@ import {
     VoiceConnectionRateLimitError
 } from '../src/audio/GuildAudioSessionManager.js';
 import type { AudioResourceManager } from '../src/audio/AudioResourceManager.js';
-import type { BeanAudioResource, TrackMetadata } from '../src/audio/types.js';
+import type {
+    AutoplayTrackResolver,
+    BeanAudioResource,
+    TrackMetadata
+} from '../src/audio/types.js';
 
 type FakeConnection = EventEmitter & {
     state: any;
@@ -102,9 +106,7 @@ const createResources = () => {
 };
 
 const flushTransitions = async () => {
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    for (let index = 0; index < 10; index++) await Promise.resolve();
 };
 
 describe('GuildAudioSessionManager', () => {
@@ -270,6 +272,115 @@ describe('GuildAudioSessionManager', () => {
         expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({
             metadata: expect.objectContaining({ kind: 'elevator' })
         }));
+    });
+
+    it('autoplays a related track when an enabled queue becomes empty', async () => {
+        const related = { ...makeTrack('related'), autoplay: true };
+        const autoplayResolver = {
+            resolveAutoplay: vi.fn().mockResolvedValue(related)
+        };
+        manager = new GuildAudioSessionManager(
+            resources as unknown as AudioResourceManager,
+            300_000,
+            15_000,
+            15_000,
+            600_000,
+            20_000,
+            30_000,
+            5_000,
+            5_000,
+            60_000,
+            autoplayResolver as AutoplayTrackResolver
+        );
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        expect(manager.isAutoplayEnabled('guild-a')).toBe(false);
+
+        const seed = makeTrack('seed');
+        manager.enqueue('guild-a', seed, null);
+        await flushTransitions();
+        expect(manager.setAutoplay('guild-a', true)).toBe(true);
+        expect(manager.isAutoplayEnabled('guild-a')).toBe(true);
+
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+
+        expect(autoplayResolver.resolveAutoplay).toHaveBeenCalledWith(seed, expect.any(AbortSignal));
+        expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({ metadata: related }));
+        expect(resources.createElevatorResource).not.toHaveBeenCalled();
+    });
+
+    it('switches elevator music to autoplay as soon as autoplay is enabled', async () => {
+        const related = { ...makeTrack('related'), autoplay: true };
+        const autoplayResolver = {
+            resolveAutoplay: vi.fn().mockResolvedValue(related)
+        };
+        manager = new GuildAudioSessionManager(
+            resources as unknown as AudioResourceManager,
+            300_000,
+            15_000,
+            15_000,
+            600_000,
+            20_000,
+            30_000,
+            5_000,
+            5_000,
+            60_000,
+            autoplayResolver as AutoplayTrackResolver
+        );
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        manager.enqueue('guild-a', makeTrack('seed'), null);
+        await flushTransitions();
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+        expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({
+            metadata: expect.objectContaining({ kind: 'elevator' })
+        }));
+
+        manager.setAutoplay('guild-a', true);
+        await flushTransitions();
+
+        expect(player.stop).toHaveBeenCalled();
+        expect(resources.release).toHaveBeenCalledWith(expect.objectContaining({
+            metadata: expect.objectContaining({ kind: 'elevator' })
+        }));
+        expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({ metadata: related }));
+    });
+
+    it('finishes the current track before returning to elevator music when autoplay is disabled', async () => {
+        const related = { ...makeTrack('related'), autoplay: true };
+        const autoplayResolver = {
+            resolveAutoplay: vi.fn().mockResolvedValue(related)
+        };
+        manager = new GuildAudioSessionManager(
+            resources as unknown as AudioResourceManager,
+            300_000,
+            15_000,
+            15_000,
+            600_000,
+            20_000,
+            30_000,
+            5_000,
+            5_000,
+            60_000,
+            autoplayResolver as AutoplayTrackResolver
+        );
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        manager.enqueue('guild-a', makeTrack('seed'), null);
+        await flushTransitions();
+        manager.setAutoplay('guild-a', true);
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+
+        expect(manager.setAutoplay('guild-a', false)).toBe(true);
+        expect(player.stop).toHaveBeenCalledTimes(0);
+        expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({ metadata: related }));
+
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+        expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({
+            metadata: expect.objectContaining({ kind: 'elevator' })
+        }));
+        expect(autoplayResolver.resolveAutoplay).toHaveBeenCalledTimes(1);
     });
 
     it('discards a released preload and constructs a fresh resource for the track', async () => {

@@ -202,6 +202,61 @@ export class TrackResolver {
         };
     }
 
+    public async resolveAutoplay(
+        seed: TrackMetadata,
+        signal?: AbortSignal
+    ): Promise<TrackMetadata> {
+        if (signal?.aborted) throw createCancellationError();
+
+        let stdout: Buffer;
+        try {
+            ({ stdout } = await this.processes.collect(
+                this.createAutoplayArguments(this.createAutoplayInput(seed)),
+                {
+                    signal,
+                    timeoutMs: this.timeoutMs,
+                    maxStdoutBytes: this.maxStdoutBytes
+                }
+            ));
+        } catch (error) {
+            throw this.mapProcessError(error);
+        }
+
+        const candidates = stdout.toString('utf8')
+            .split(/\r?\n/)
+            .filter(line => line.trim().length > 0)
+            .map(line => {
+                try {
+                    return JSON.parse(line) as unknown;
+                } catch {
+                    return undefined;
+                }
+            })
+            .filter(isYtDlpMetadata);
+
+        for (const candidate of candidates) {
+            const title = normalizeTrackTitle(candidate.title);
+            const mediaUrl = normalizeMediaUrl(candidate.webpage_url);
+            if (!title || !mediaUrl || mediaUrl === normalizeMediaUrl(seed.url)) continue;
+
+            return {
+                kind: 'track',
+                id: randomUUID(),
+                title,
+                url: mediaUrl,
+                duration: candidate.duration ?? undefined,
+                thumbnail: normalizeHttpUrl(candidate.thumbnail),
+                requestedBy: seed.requestedBy,
+                autoplay: true
+            };
+        }
+
+        throw new TrackResolverError(
+            'No related track was available for autoplay.',
+            'INVALID_RESPONSE'
+        );
+    }
+
     private mapProcessError(error: unknown): TrackResolverError {
         if (!(error instanceof YtDlpProcessError)) {
             const cause = asError(error);
@@ -289,6 +344,41 @@ export class TrackResolver {
             '--',
             input
         ];
+    }
+
+    private createAutoplayArguments(input: string): string[] {
+        return [
+            '--ignore-config',
+            '--flat-playlist',
+            '--playlist-end', '10',
+            '--quiet',
+            '--print',
+            '%(.{title,webpage_url,duration,thumbnail})j',
+            '--',
+            input
+        ];
+    }
+
+    private createAutoplayInput(seed: TrackMetadata): string {
+        try {
+            const url = new URL(seed.url);
+            const hostname = url.hostname.toLowerCase();
+            const videoId = hostname === 'youtu.be'
+                ? url.pathname.split('/').filter(Boolean)[0]
+                : hostname === 'youtube.com' || hostname.endsWith('.youtube.com') ||
+                    hostname === 'youtube-nocookie.com' || hostname.endsWith('.youtube-nocookie.com')
+                    ? url.searchParams.get('v') ?? undefined
+                    : undefined;
+
+            if (videoId) {
+                const encodedId = encodeURIComponent(videoId);
+                return `https://www.youtube.com/watch?v=${encodedId}&list=RD${encodedId}`;
+            }
+        } catch {
+            // Track URLs are already validated, but title search remains a safe fallback.
+        }
+
+        return `ytsearch10:${seed.title} official audio`;
     }
 
     private logYtDlpFailure(outcome: string, stderrData: Buffer): void {

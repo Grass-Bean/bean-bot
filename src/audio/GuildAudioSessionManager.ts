@@ -13,7 +13,9 @@ import { escapeMarkdown, TextChannel, type MessageCreateOptions } from 'discord.
 import { Deque, MAX_QUEUE_SIZE } from './Deque.js';
 import { audioResourceManager, AudioResourceManager } from './AudioResourceManager.js';
 import { createNowPlayingEmbed } from './audioPresentation.js';
+import { trackResolver } from './TrackResolver.js';
 import type {
+    AutoplayTrackResolver,
     AudioMetadata,
     AudioQueueSnapshot,
     BeanAudioResource,
@@ -68,7 +70,8 @@ export class GuildAudioSessionManager {
         private readonly trackStallTimeoutMs = 30_000,
         private readonly trackWatchdogIntervalMs = 5_000,
         private readonly externalDisconnectGraceTimeoutMs = 5_000,
-        private readonly rateLimitCooldownMs = 60_000
+        private readonly rateLimitCooldownMs = 60_000,
+        private readonly autoplayResolver: AutoplayTrackResolver = trackResolver
     ) {}
 
     public async connect(
@@ -113,6 +116,7 @@ export class GuildAudioSessionManager {
             queue: new Deque<QueuedTrack>(),
             announcementChannel: null,
             transition: Promise.resolve(),
+            autoplayEnabled: false,
             hasBeenReady: connection.state.status === VoiceConnectionStatus.Ready,
             closing: false
         };
@@ -223,6 +227,41 @@ export class GuildAudioSessionManager {
         return Boolean(session && !session.closing && session.queue.size() >= MAX_QUEUE_SIZE);
     }
 
+    public isAutoplayEnabled(guildId: string): boolean {
+        const session = this.sessions.get(guildId);
+        return Boolean(session && !session.closing && session.autoplayEnabled);
+    }
+
+    public setAutoplay(guildId: string, enabled: boolean): boolean {
+        const session = this.sessions.get(guildId);
+        if (!session || session.closing) return false;
+        if (session.autoplayEnabled === enabled) return true;
+
+        session.autoplayEnabled = enabled;
+        if (!enabled) {
+            session.autoplayController?.abort();
+            if (!session.current) {
+                void this.schedule(session, () => this.startNext(session));
+            }
+            return true;
+        }
+
+        this.clearInactivityTimer(session);
+        if (session.current?.metadata.kind === 'elevator') {
+            const elevator = session.current;
+            session.player.stop();
+            void this.schedule(session, async () => {
+                if (session.current !== elevator) return;
+                this.releaseCurrent(session);
+                await this.startNext(session);
+            });
+        } else if (!session.current) {
+            void this.schedule(session, () => this.startNext(session));
+        }
+
+        return true;
+    }
+
     public enqueue(guildId: string, track: TrackMetadata, channel: TextChannel | null): EnqueueResult {
         const session = this.requireSession(guildId);
         const queueWasEmpty = session.queue.size() === 0;
@@ -231,6 +270,7 @@ export class GuildAudioSessionManager {
             return { accepted: false, startsImmediately: false, position: MAX_QUEUE_SIZE };
         }
 
+        session.autoplayController?.abort();
         const startsImmediately = queueWasEmpty && (!session.current || currentKind === 'elevator');
 
         this.clearInactivityTimer(session);
@@ -453,6 +493,8 @@ export class GuildAudioSessionManager {
         this.clearInactivityTimer(session);
         this.clearTrackWatchdog(session);
         this.cancelRecovery(session);
+        session.autoplayController?.abort();
+        session.autoplayController = undefined;
 
         session.player.removeAllListeners();
         session.player.stop(true);
@@ -473,6 +515,10 @@ export class GuildAudioSessionManager {
         while (!session.closing) {
             const queuedTrack = session.queue.popFront();
             if (!queuedTrack) {
+                if (session.autoplayEnabled && session.lastTrack) {
+                    if (await this.startAutoplay(session)) return;
+                    if (session.queue.size() > 0) continue;
+                }
                 this.startElevatorMusic(session);
                 return;
             }
@@ -484,6 +530,7 @@ export class GuildAudioSessionManager {
             try {
                 const resource = this.takePreload(session, track) ?? this.resources.createTrackResource(track);
                 session.current = resource;
+                session.lastTrack = track;
                 session.player.play(resource);
                 this.startTrackWatchdog(session, resource);
                 this.notify(session, {
@@ -498,6 +545,49 @@ export class GuildAudioSessionManager {
                     session,
                     `⚠️ **Couldn’t play ${escapeMarkdown(track.title)}**\nSkipping to the next track.`
                 );
+            }
+        }
+    }
+
+    private async startAutoplay(session: GuildAudioSession): Promise<boolean> {
+        const seed = session.lastTrack;
+        if (!session.autoplayEnabled || !seed || session.closing || session.current) return false;
+
+        this.clearInactivityTimer(session);
+        session.autoplayController?.abort();
+        const controller = new AbortController();
+        session.autoplayController = controller;
+
+        let resource: BeanAudioResource | undefined;
+        try {
+            const track = await this.autoplayResolver.resolveAutoplay(seed, controller.signal);
+            if (
+                controller.signal.aborted ||
+                session.autoplayController !== controller ||
+                !session.autoplayEnabled ||
+                session.closing ||
+                session.current ||
+                session.queue.size() > 0
+            ) return false;
+
+            resource = this.resources.createTrackResource(track);
+            session.current = resource;
+            session.lastTrack = track;
+            session.player.play(resource);
+            this.startTrackWatchdog(session, resource);
+            this.notify(session, {
+                embeds: [createNowPlayingEmbed(track, session.queue.size())]
+            });
+            return true;
+        } catch (error) {
+            if (resource && session.current === resource) this.releaseCurrent(session);
+            if (!controller.signal.aborted) {
+                console.error(`Failed to start autoplay in guild ${session.guildId}:`, error);
+            }
+            return false;
+        } finally {
+            if (session.autoplayController === controller) {
+                session.autoplayController = undefined;
             }
         }
     }
