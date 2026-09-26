@@ -6,6 +6,9 @@ import type {
 import type { TextChannel } from 'discord.js';
 import type { Readable } from 'node:stream';
 import type { Deque } from './Deque.js';
+import type { CountedSlidingWindow, UniqueSlidingWindow } from './SlidingWindow.js';
+import type { TrackPlaybackHistory } from './TrackPlaybackHistory.js';
+import type { MediaKey, TransitionKey } from './mediaIdentity.js';
 
 export interface TrackMetadata {
     kind: 'track';
@@ -66,13 +69,24 @@ export interface GuildAudioSession {
     autoplayEnabled: boolean;
     lastTrack?: TrackMetadata;
     autoplayController?: AbortController;
+    autoplayHistory: AutoplaySessionHistory;
     recovery?: VoiceRecovery;
     hasBeenReady: boolean;
     closing: boolean;
 }
 
+export interface AutoplaySessionHistory {
+    tracks: TrackPlaybackHistory<MediaKey>;
+    transitionCounts: CountedSlidingWindow<TransitionKey>;
+    manualSeeds: UniqueSlidingWindow<MediaKey, TrackMetadata>;
+}
+
 export interface AutoplayTrackResolver {
-    resolveAutoplay(seed: TrackMetadata, signal?: AbortSignal): Promise<TrackMetadata>;
+    resolveAutoplayCandidates(
+        seed: TrackMetadata,
+        limit: number,
+        signal?: AbortSignal
+    ): Promise<readonly TrackMetadata[]>;
 }
 
 export interface YtDlpMetadata {

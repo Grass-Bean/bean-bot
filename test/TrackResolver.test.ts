@@ -142,6 +142,30 @@ describe('TrackResolver', () => {
         );
     });
 
+    it('returns a deduplicated autoplay candidate pool at the requested depth', async () => {
+        vi.mocked(processes.collect).mockResolvedValue(collected(
+            [
+                metadata(),
+                metadata({ title: 'Related', webpage_url: 'https://youtu.be/related' }),
+                metadata({ title: 'Duplicate', webpage_url: 'https://youtube.com/watch?v=related' }),
+                metadata({ title: 'Another', webpage_url: 'https://youtube.com/watch?v=another' })
+            ].map(item => JSON.stringify(item)).join('\n')
+        ));
+        const seed: TrackMetadata = {
+            kind: 'track',
+            id: 'seed',
+            title: 'A Song',
+            url: 'https://www.youtube.com/watch?v=abc',
+            requestedBy: 'user-a'
+        };
+
+        const candidates = await new TrackResolver({}, processes)
+            .resolveAutoplayCandidates(seed, 50);
+
+        expect(candidates.map(track => track.title)).toEqual(['Related', 'Another']);
+        expect(vi.mocked(processes.collect).mock.calls[0]![0]).toContain('50');
+    });
+
     it('reports when autoplay has no usable recommendation', async () => {
         vi.mocked(processes.collect).mockResolvedValue(collected(metadata()));
         const seed: TrackMetadata = {

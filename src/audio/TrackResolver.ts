@@ -11,6 +11,7 @@ import {
     ytDlpProcessManager
 } from './YtDlpProcessManager.js';
 import { sanitizeLogText } from './sanitizeLogText.js';
+import { getMediaKey, getYouTubeVideoId } from './mediaIdentity.js';
 
 export type { TrackResolverErrorCode, TrackResolverOptions } from './types.js';
 
@@ -102,26 +103,6 @@ const normalizeMediaUrl = (value: string): string | undefined => {
     const url = new URL(normalized);
     if (url.username || url.password || !isAllowedMediaHost(url.hostname)) return undefined;
     return normalized;
-};
-
-const getYouTubeVideoId = (value: string): string | undefined => {
-    try {
-        const url = new URL(value);
-        const hostname = url.hostname.toLowerCase();
-        if (hostname === 'youtu.be') {
-            return url.pathname.split('/').filter(Boolean)[0];
-        }
-        if (
-            hostname === 'youtube.com' || hostname.endsWith('.youtube.com') ||
-            hostname === 'youtube-nocookie.com' || hostname.endsWith('.youtube-nocookie.com')
-        ) {
-            return url.searchParams.get('v') ?? undefined;
-        }
-    } catch {
-        return undefined;
-    }
-
-    return undefined;
 };
 
 const getYouTubeThumbnail = (mediaUrl: string): string | undefined => {
@@ -233,12 +214,28 @@ export class TrackResolver {
         seed: TrackMetadata,
         signal?: AbortSignal
     ): Promise<TrackMetadata> {
+        const candidates = await this.resolveAutoplayCandidates(seed, 10, signal);
+        const candidate = candidates[0];
+        if (candidate) return candidate;
+
+        throw new TrackResolverError(
+            'No related track was available for autoplay.',
+            'INVALID_RESPONSE'
+        );
+    }
+
+    public async resolveAutoplayCandidates(
+        seed: TrackMetadata,
+        limit: number,
+        signal?: AbortSignal
+    ): Promise<readonly TrackMetadata[]> {
+        requireIntegerOption('limit', limit, 100);
         if (signal?.aborted) throw createCancellationError();
 
         let stdout: Buffer;
         try {
             ({ stdout } = await this.processes.collect(
-                this.createAutoplayArguments(this.createAutoplayInput(seed)),
+                this.createAutoplayArguments(this.createAutoplayInput(seed), limit),
                 {
                     signal,
                     timeoutMs: this.timeoutMs,
@@ -261,12 +258,15 @@ export class TrackResolver {
             })
             .filter(isYtDlpMetadata);
 
+        const seedKey = getMediaKey(seed);
+        const seen = new Set<string>([seedKey]);
+        const tracks: TrackMetadata[] = [];
         for (const candidate of candidates) {
             const title = normalizeTrackTitle(candidate.title);
             const mediaUrl = normalizeMediaUrl(candidate.webpage_url);
-            if (!title || !mediaUrl || mediaUrl === normalizeMediaUrl(seed.url)) continue;
+            if (!title || !mediaUrl) continue;
 
-            return {
+            const track: TrackMetadata = {
                 kind: 'track',
                 id: randomUUID(),
                 title,
@@ -276,12 +276,13 @@ export class TrackResolver {
                 requestedBy: seed.requestedBy,
                 autoplay: true
             };
+            const mediaKey = getMediaKey(track);
+            if (seen.has(mediaKey)) continue;
+            seen.add(mediaKey);
+            tracks.push(track);
         }
 
-        throw new TrackResolverError(
-            'No related track was available for autoplay.',
-            'INVALID_RESPONSE'
-        );
+        return tracks;
     }
 
     private mapProcessError(error: unknown): TrackResolverError {
@@ -373,11 +374,11 @@ export class TrackResolver {
         ];
     }
 
-    private createAutoplayArguments(input: string): string[] {
+    private createAutoplayArguments(input: string, limit: number): string[] {
         return [
             '--ignore-config',
             '--flat-playlist',
-            '--playlist-end', '10',
+            '--playlist-end', String(limit),
             '--quiet',
             '--print',
             '%(.{title,webpage_url,duration,thumbnail})j',

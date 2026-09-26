@@ -27,6 +27,7 @@ import {
     GuildAudioSessionManager,
     VoiceConnectionRateLimitError
 } from '../src/audio/GuildAudioSessionManager.js';
+import { AutoplaySelector } from '../src/audio/AutoplaySelector.js';
 import type { AudioResourceManager } from '../src/audio/AudioResourceManager.js';
 import type {
     AutoplayTrackResolver,
@@ -277,7 +278,7 @@ describe('GuildAudioSessionManager', () => {
     it('autoplays a related track when an enabled queue becomes empty', async () => {
         const related = { ...makeTrack('related'), autoplay: true };
         const autoplayResolver = {
-            resolveAutoplay: vi.fn().mockResolvedValue(related)
+            resolveAutoplayCandidates: vi.fn().mockResolvedValue([related])
         };
         manager = new GuildAudioSessionManager(
             resources as unknown as AudioResourceManager,
@@ -304,7 +305,11 @@ describe('GuildAudioSessionManager', () => {
         player.emit(AudioPlayerStatus.Idle);
         await flushTransitions();
 
-        expect(autoplayResolver.resolveAutoplay).toHaveBeenCalledWith(seed, expect.any(AbortSignal));
+        expect(autoplayResolver.resolveAutoplayCandidates).toHaveBeenCalledWith(
+            seed,
+            50,
+            expect.any(AbortSignal)
+        );
         expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({ metadata: related }));
         expect(resources.createElevatorResource).not.toHaveBeenCalled();
     });
@@ -312,7 +317,7 @@ describe('GuildAudioSessionManager', () => {
     it('switches elevator music to autoplay as soon as autoplay is enabled', async () => {
         const related = { ...makeTrack('related'), autoplay: true };
         const autoplayResolver = {
-            resolveAutoplay: vi.fn().mockResolvedValue(related)
+            resolveAutoplayCandidates: vi.fn().mockResolvedValue([related])
         };
         manager = new GuildAudioSessionManager(
             resources as unknown as AudioResourceManager,
@@ -346,10 +351,51 @@ describe('GuildAudioSessionManager', () => {
         expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({ metadata: related }));
     });
 
+    it('filters recent candidates and performs at most one alternate-seed lookup', async () => {
+        const first = makeTrack('first');
+        const second = makeTrack('second');
+        const related = { ...makeTrack('related'), autoplay: true };
+        const autoplayResolver = {
+            resolveAutoplayCandidates: vi.fn()
+                .mockResolvedValueOnce([{ ...first, autoplay: true }, { ...second, autoplay: true }])
+                .mockResolvedValueOnce([related])
+        };
+        const selector = new AutoplaySelector({ next: () => 0.99 });
+        manager = new GuildAudioSessionManager(
+            resources as unknown as AudioResourceManager,
+            300_000,
+            15_000,
+            15_000,
+            600_000,
+            20_000,
+            30_000,
+            5_000,
+            5_000,
+            60_000,
+            autoplayResolver as AutoplayTrackResolver,
+            selector
+        );
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        manager.enqueue('guild-a', first, null);
+        manager.enqueue('guild-a', second, null);
+        await flushTransitions();
+        manager.setAutoplay('guild-a', true);
+
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+
+        expect(autoplayResolver.resolveAutoplayCandidates).toHaveBeenCalledTimes(2);
+        expect(autoplayResolver.resolveAutoplayCandidates.mock.calls[0]![0]).toBe(second);
+        expect(autoplayResolver.resolveAutoplayCandidates.mock.calls[1]![0]).toEqual(first);
+        expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({ metadata: related }));
+    });
+
     it('finishes the current track before returning to elevator music when autoplay is disabled', async () => {
         const related = { ...makeTrack('related'), autoplay: true };
         const autoplayResolver = {
-            resolveAutoplay: vi.fn().mockResolvedValue(related)
+            resolveAutoplayCandidates: vi.fn().mockResolvedValue([related])
         };
         manager = new GuildAudioSessionManager(
             resources as unknown as AudioResourceManager,
@@ -380,7 +426,7 @@ describe('GuildAudioSessionManager', () => {
         expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({
             metadata: expect.objectContaining({ kind: 'elevator' })
         }));
-        expect(autoplayResolver.resolveAutoplay).toHaveBeenCalledTimes(1);
+        expect(autoplayResolver.resolveAutoplayCandidates).toHaveBeenCalledTimes(1);
     });
 
     it('discards a released preload and constructs a fresh resource for the track', async () => {
