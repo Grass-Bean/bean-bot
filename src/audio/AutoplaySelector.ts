@@ -1,23 +1,17 @@
 import { randomInt } from 'node:crypto';
 import {
-    AUTOPLAY_ANCHORED_CONTEXT_SEED_WEIGHT,
-    AUTOPLAY_ANCHORED_MANUAL_SEED_WEIGHT,
-    AUTOPLAY_CONTEXT_SEED_WEIGHT,
-    AUTOPLAY_EXPLORATION_FLOOR,
-    AUTOPLAY_MANUAL_ANCHOR_INTERVAL,
-    AUTOPLAY_MANUAL_SEED_WEIGHT,
     AUTOPLAY_PLAY_PENALTY_BASE,
     AUTOPLAY_PLAY_PENALTY_CAP,
     AUTOPLAY_RECIPROCAL_RANK_OFFSET,
-    AUTOPLAY_TRANSITION_PENALTY_BASE,
-    AUTOPLAY_TRANSITION_PENALTY_CAP
+    AUTOPLAY_SEED_RECENCY_DECAY,
+    AUTOPLAY_SEED_WINDOW_SIZE,
+    AUTOPLAY_SELECTION_POOL_SIZE
 } from './autoplayConstants.js';
-import { getMediaKey, getTransitionKey, type MediaKey } from './mediaIdentity.js';
+import { getMediaKey, type MediaKey } from './mediaIdentity.js';
 import { TrackPlaybackScope } from './TrackPlaybackHistory.js';
 import type {
     AutoplayCandidateBatch,
     AutoplaySeed,
-    AutoplaySeedPlan,
     AutoplaySeedSource,
     AutoplaySelection,
     AutoplaySessionHistory,
@@ -46,67 +40,32 @@ interface CandidateAccumulator {
 export class AutoplaySelector {
     public constructor(private readonly entropy: EntropySource = cryptoEntropySource) {}
 
-    public selectSeedPlan(
-        lastTrack: TrackMetadata,
-        history: AutoplaySessionHistory
-    ): AutoplaySeedPlan {
-        const lastTrackKey = getMediaKey(lastTrack);
-        const manualSeeds = this.getManualSeeds(history, lastTrackKey);
-        const manualAnchorApplied = manualSeeds.length > 0 &&
-            history.autoplayTracksSinceManualAnchor >= AUTOPLAY_MANUAL_ANCHOR_INTERVAL - 1;
-        const seeds: AutoplaySeed[] = [{
-            track: lastTrack,
-            mediaKey: lastTrackKey,
-            source: 'context',
-            weight: manualAnchorApplied
-                ? AUTOPLAY_ANCHORED_CONTEXT_SEED_WEIGHT
-                : AUTOPLAY_CONTEXT_SEED_WEIGHT
-        }];
+    public selectSeeds(history: AutoplaySessionHistory): readonly AutoplaySeed[] {
+        const seeds = new Map<MediaKey, AutoplaySeed>();
+        const entries = history.tracks
+            .entriesNewestFirst(TrackPlaybackScope.Recent)
+            .slice(0, AUTOPLAY_SEED_WINDOW_SIZE);
 
-        if (manualSeeds.length > 0) {
-            const manualSeed = manualSeeds[history.manualSeedCursor % manualSeeds.length]!;
-            seeds.push({
-                track: manualSeed,
-                mediaKey: getMediaKey(manualSeed),
-                source: 'manual',
-                weight: manualAnchorApplied
-                    ? AUTOPLAY_ANCHORED_MANUAL_SEED_WEIGHT
-                    : AUTOPLAY_MANUAL_SEED_WEIGHT
+        entries.forEach((entry, age) => {
+            const weight = Math.pow(AUTOPLAY_SEED_RECENCY_DECAY, age);
+            const existing = seeds.get(entry.mediaKey);
+            if (existing) {
+                existing.weight += weight;
+                return;
+            }
+
+            seeds.set(entry.mediaKey, {
+                track: entry.track,
+                mediaKey: entry.mediaKey,
+                source: entry.source,
+                weight
             });
-        }
+        });
 
-        return {
-            seeds,
-            manualAnchorApplied,
-            manualSeedCount: manualSeeds.length
-        };
-    }
-
-    public commitSeedPlan(
-        history: AutoplaySessionHistory,
-        plan: AutoplaySeedPlan
-    ): void {
-        if (plan.manualAnchorApplied) {
-            history.autoplayTracksSinceManualAnchor = 0;
-            history.manualSeedCursor = plan.manualSeedCount === 0
-                ? 0
-                : (history.manualSeedCursor + 1) % plan.manualSeedCount;
-            return;
-        }
-
-        history.autoplayTracksSinceManualAnchor = Math.min(
-            history.autoplayTracksSinceManualAnchor + 1,
-            AUTOPLAY_MANUAL_ANCHOR_INTERVAL - 1
-        );
-    }
-
-    public resetSeedSchedule(history: AutoplaySessionHistory): void {
-        history.autoplayTracksSinceManualAnchor = 0;
-        history.manualSeedCursor = 0;
+        return [...seeds.values()];
     }
 
     public selectCandidate(
-        lastTrack: TrackMetadata,
         batches: readonly AutoplayCandidateBatch[],
         history: AutoplaySessionHistory
     ): AutoplaySelection | undefined {
@@ -145,24 +104,16 @@ export class AutoplaySelector {
             });
         }
 
-        const lastTrackKey = getMediaKey(lastTrack);
-        const scored = [...accumulated.values()].map((candidate): RankedCandidate => {
+        const ranked = [...accumulated.values()].map((candidate): RankedCandidate => {
             const playCount = history.tracks.count(
                 TrackPlaybackScope.PlayCount,
                 candidate.mediaKey
-            );
-            const transitionCount = history.transitionCounts.count(
-                getTransitionKey(lastTrackKey, candidate.mediaKey)
             );
             const playPenalty = Math.pow(
                 AUTOPLAY_PLAY_PENALTY_BASE,
                 Math.min(playCount, AUTOPLAY_PLAY_PENALTY_CAP)
             );
-            const transitionPenalty = Math.pow(
-                AUTOPLAY_TRANSITION_PENALTY_BASE,
-                Math.min(transitionCount, AUTOPLAY_TRANSITION_PENALTY_CAP)
-            );
-            const finalScore = candidate.youtubeScore * playPenalty * transitionPenalty;
+            const finalScore = candidate.youtubeScore * playPenalty;
 
             return {
                 track: candidate.track,
@@ -170,42 +121,20 @@ export class AutoplaySelector {
                 youtubeRank: candidate.youtubeRank,
                 seedSources: [...candidate.seedSources],
                 playCount,
-                transitionCount,
                 youtubeScore: candidate.youtubeScore,
                 finalScore,
-                selectionWeight: 0
+                selectionWeight: finalScore
             };
-        });
+        }).sort((left, right) => right.finalScore - left.finalScore)
+            .slice(0, AUTOPLAY_SELECTION_POOL_SIZE);
 
-        if (scored.length === 0) return undefined;
-
-        const totalScore = scored.reduce((sum, candidate) => sum + candidate.finalScore, 0);
-        const explorationShare = AUTOPLAY_EXPLORATION_FLOOR / scored.length;
-        for (const candidate of scored) {
-            candidate.selectionWeight =
-                (1 - AUTOPLAY_EXPLORATION_FLOOR) * (candidate.finalScore / totalScore) +
-                explorationShare;
-        }
-
-        return this.weightedPick(scored);
+        if (ranked.length === 0) return undefined;
+        const selected = this.weightedPick(ranked);
+        const { selectionWeight: _, ...selection } = selected;
+        return selection;
     }
 
-    private getManualSeeds(
-        history: AutoplaySessionHistory,
-        excludedKey: MediaKey
-    ): TrackMetadata[] {
-        const seeds: TrackMetadata[] = [];
-
-        for (const track of history.manualSeeds.valuesNewestFirst()) {
-            if (track.autoplay) continue;
-            if (getMediaKey(track) === excludedKey) continue;
-            seeds.push(track);
-        }
-
-        return seeds;
-    }
-
-    private weightedPick(candidates: readonly RankedCandidate[]): AutoplaySelection {
+    private weightedPick(candidates: readonly RankedCandidate[]): RankedCandidate {
         const totalWeight = candidates.reduce(
             (sum, candidate) => sum + candidate.selectionWeight,
             0

@@ -1,14 +1,16 @@
 import { SlidingWindow } from './SlidingWindow.js';
+import type { MediaKey } from './mediaIdentity.js';
+import type { TrackPlaybackEntry } from './types.js';
 
 export enum TrackPlaybackScope {
     Recent = 'recent',
     PlayCount = 'play-count'
 }
 
-export class TrackPlaybackHistory<K> {
-    private readonly events: SlidingWindow<K>;
-    private readonly recentCounts = new Map<K, number>();
-    private readonly playCounts = new Map<K, number>();
+export class TrackPlaybackHistory {
+    private readonly events: SlidingWindow<TrackPlaybackEntry>;
+    private readonly recentCounts = new Map<MediaKey, number>();
+    private readonly playCounts = new Map<MediaKey, number>();
 
     public constructor(
         public readonly recentCapacity: number,
@@ -24,35 +26,35 @@ export class TrackPlaybackHistory<K> {
             throw new RangeError('Recent playback capacity cannot exceed play-count capacity.');
         }
 
-        this.events = new SlidingWindow<K>(playCountCapacity);
+        this.events = new SlidingWindow<TrackPlaybackEntry>(playCountCapacity);
     }
 
-    public record(key: K): void {
+    public record(entry: TrackPlaybackEntry): void {
         const eventCount = this.events.size();
 
         if (eventCount >= this.recentCapacity) {
             this.decrement(
                 this.recentCounts,
-                this.events.valueAt(eventCount - this.recentCapacity)
+                this.events.valueAt(eventCount - this.recentCapacity).mediaKey
             );
         }
         if (eventCount >= this.playCountCapacity) {
             this.decrement(
                 this.playCounts,
-                this.events.valueAt(eventCount - this.playCountCapacity)
+                this.events.valueAt(eventCount - this.playCountCapacity).mediaKey
             );
         }
 
-        this.events.push(key);
-        this.increment(this.recentCounts, key);
-        this.increment(this.playCounts, key);
+        this.events.push(entry);
+        this.increment(this.recentCounts, entry.mediaKey);
+        this.increment(this.playCounts, entry.mediaKey);
     }
 
-    public has(scope: TrackPlaybackScope, key: K): boolean {
+    public has(scope: TrackPlaybackScope, key: MediaKey): boolean {
         return this.countsFor(scope).has(key);
     }
 
-    public count(scope: TrackPlaybackScope, key: K): number {
+    public count(scope: TrackPlaybackScope, key: MediaKey): number {
         return this.countsFor(scope).get(key) ?? 0;
     }
 
@@ -65,7 +67,11 @@ export class TrackPlaybackHistory<K> {
         );
     }
 
-    private countsFor(scope: TrackPlaybackScope): ReadonlyMap<K, number> {
+    public entriesNewestFirst(scope: TrackPlaybackScope): readonly TrackPlaybackEntry[] {
+        return this.events.valuesNewestFirst().slice(0, this.size(scope));
+    }
+
+    private countsFor(scope: TrackPlaybackScope): ReadonlyMap<MediaKey, number> {
         switch (scope) {
             case TrackPlaybackScope.Recent:
                 return this.recentCounts;
@@ -74,11 +80,11 @@ export class TrackPlaybackHistory<K> {
         }
     }
 
-    private increment(counts: Map<K, number>, key: K): void {
+    private increment(counts: Map<MediaKey, number>, key: MediaKey): void {
         counts.set(key, (counts.get(key) ?? 0) + 1);
     }
 
-    private decrement(counts: Map<K, number>, key: K): void {
+    private decrement(counts: Map<MediaKey, number>, key: MediaKey): void {
         const remaining = (counts.get(key) ?? 0) - 1;
         if (remaining <= 0) counts.delete(key);
         else counts.set(key, remaining);

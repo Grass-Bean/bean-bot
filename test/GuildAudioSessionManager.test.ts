@@ -351,7 +351,7 @@ describe('GuildAudioSessionManager', () => {
         expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({ metadata: related }));
     });
 
-    it('fuses context and manual seed lookups', async () => {
+    it('aggregates cached lookups from recent playback seeds', async () => {
         const first = makeTrack('first');
         const second = makeTrack('second');
         const related = { ...makeTrack('related'), autoplay: true };
@@ -359,6 +359,7 @@ describe('GuildAudioSessionManager', () => {
             resolveAutoplayCandidates: vi.fn()
                 .mockResolvedValueOnce([{ ...first, autoplay: true }, { ...second, autoplay: true }])
                 .mockResolvedValueOnce([related])
+                .mockResolvedValue([])
         };
         const selector = new AutoplaySelector({ next: () => 0.99 });
         manager = new GuildAudioSessionManager(
@@ -386,9 +387,10 @@ describe('GuildAudioSessionManager', () => {
         player.emit(AudioPlayerStatus.Idle);
         await flushTransitions();
 
-        expect(autoplayResolver.resolveAutoplayCandidates).toHaveBeenCalledTimes(2);
-        expect(autoplayResolver.resolveAutoplayCandidates.mock.calls[0]![0]).toBe(second);
-        expect(autoplayResolver.resolveAutoplayCandidates.mock.calls[1]![0]).toEqual(first);
+        expect(autoplayResolver.resolveAutoplayCandidates).toHaveBeenCalledTimes(3);
+        expect(autoplayResolver.resolveAutoplayCandidates.mock.calls[0]![0]).toEqual(first);
+        expect(autoplayResolver.resolveAutoplayCandidates.mock.calls[1]![0]).toEqual(second);
+        expect(autoplayResolver.resolveAutoplayCandidates.mock.calls[2]![0]).toBe(related);
         expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({ metadata: related }));
     });
 
@@ -436,9 +438,9 @@ describe('GuildAudioSessionManager', () => {
         player.emit(AudioPlayerStatus.Idle);
         await flushTransitions();
 
-        expect(autoplayResolver.resolveAutoplayCandidates).toHaveBeenCalledTimes(3);
+        expect(autoplayResolver.resolveAutoplayCandidates).toHaveBeenCalledTimes(4);
         expect(autoplayResolver.resolveAutoplayCandidates.mock.calls.map(call => call[0].id))
-            .toEqual(['second', 'first', 'autoplay-one']);
+            .toEqual(['first', 'second', 'autoplay-one', 'autoplay-two']);
         expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({
             metadata: autoplayTwo
         }));
@@ -478,7 +480,7 @@ describe('GuildAudioSessionManager', () => {
         expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({
             metadata: expect.objectContaining({ kind: 'elevator' })
         }));
-        expect(autoplayResolver.resolveAutoplayCandidates).toHaveBeenCalledTimes(1);
+        expect(autoplayResolver.resolveAutoplayCandidates).toHaveBeenCalledTimes(2);
     });
 
     it('discards a released preload and constructs a fresh resource for the track', async () => {

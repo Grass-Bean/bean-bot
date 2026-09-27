@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { AutoplaySelector } from '../src/audio/AutoplaySelector.js';
-import { CountedSlidingWindow, UniqueSlidingWindow } from '../src/audio/SlidingWindow.js';
 import { TrackPlaybackHistory } from '../src/audio/TrackPlaybackHistory.js';
-import { getMediaKey, getTransitionKey } from '../src/audio/mediaIdentity.js';
+import { getMediaKey } from '../src/audio/mediaIdentity.js';
 import type {
     AutoplayCandidateBatch,
     AutoplaySeed,
@@ -20,22 +19,25 @@ const track = (id: string, autoplay = false): TrackMetadata => ({
     autoplay
 });
 
-const history = (): AutoplaySessionHistory => ({
-    tracks: new TrackPlaybackHistory(50, 200),
-    transitionCounts: new CountedSlidingWindow(200),
-    manualSeeds: new UniqueSlidingWindow(10),
-    autoplayTracksSinceManualAnchor: 0,
-    manualSeedCursor: 0
+const history = (recentCapacity = 50): AutoplaySessionHistory => ({
+    tracks: new TrackPlaybackHistory(recentCapacity, 200)
 });
+
+const record = (state: AutoplaySessionHistory, value: TrackMetadata): void => {
+    state.tracks.record({
+        mediaKey: getMediaKey(value),
+        track: value,
+        source: value.autoplay ? 'autoplay' : 'manual'
+    });
+};
 
 const seed = (
     value: TrackMetadata,
-    source: AutoplaySeed['source'] = 'context',
     weight = 1
 ): AutoplaySeed => ({
     track: value,
     mediaKey: getMediaKey(value),
-    source,
+    source: value.autoplay ? 'autoplay' : 'manual',
     weight
 });
 
@@ -56,123 +58,122 @@ class SequenceEntropy implements EntropySource {
 }
 
 describe('AutoplaySelector', () => {
-    it('uses deterministic manual anchors and rotates manual seeds', () => {
+    it('uses the last five playbacks as recency-decayed seeds', () => {
         const state = history();
-        const older = track('older');
-        const newer = track('newer');
-        const last = track('last', true);
-        state.manualSeeds.push(getMediaKey(older), older);
-        state.manualSeeds.push(getMediaKey(newer), newer);
-        const entropy = new SequenceEntropy([]);
-        const selector = new AutoplaySelector(entropy);
+        const played = [
+            track('zero'),
+            track('one', true),
+            track('two'),
+            track('three', true),
+            track('four'),
+            track('five', true)
+        ];
+        for (const value of played) record(state, value);
 
-        const normal = selector.selectSeedPlan(last, state);
-        expect(normal.manualAnchorApplied).toBe(false);
-        expect(normal.seeds.map(value => [value.source, value.track.id, value.weight])).toEqual([
-            ['context', 'last', 1],
-            ['manual', 'newer', 0.8]
+        const seeds = new AutoplaySelector().selectSeeds(state);
+
+        expect(seeds.map(value => [value.track.id, value.source])).toEqual([
+            ['five', 'autoplay'],
+            ['four', 'manual'],
+            ['three', 'autoplay'],
+            ['two', 'manual'],
+            ['one', 'autoplay']
         ]);
-
-        state.autoplayTracksSinceManualAnchor = 4;
-        const anchored = selector.selectSeedPlan(last, state);
-        expect(anchored.manualAnchorApplied).toBe(true);
-        expect(anchored.seeds.map(value => [value.source, value.track.id, value.weight])).toEqual([
-            ['context', 'last', 0.8],
-            ['manual', 'newer', 1.2]
+        expect(seeds.map(value => value.weight)).toEqual([
+            1,
+            0.75,
+            0.75 ** 2,
+            0.75 ** 3,
+            0.75 ** 4
         ]);
-
-        selector.commitSeedPlan(state, anchored);
-        expect(state.autoplayTracksSinceManualAnchor).toBe(0);
-        expect(selector.selectSeedPlan(last, state).seeds[1]?.track).toBe(older);
-        expect(entropy.calls).toBe(0);
     });
 
-    it('fuses rankings from context and manual recommendation pools', () => {
+    it('collates repeated playback identities into one stronger seed', () => {
         const state = history();
-        const last = track('last', true);
-        const manual = track('manual');
-        const contextOnly = track('context-only', true);
-        const manualOnly = track('manual-only', true);
-        const shared = track('shared', true);
-        const selector = new AutoplaySelector(new SequenceEntropy([0.5]));
+        const repeatedManual = track('repeated');
+        const other = track('other', true);
+        const repeatedAutoplay = track('repeated', true);
+        record(state, repeatedManual);
+        record(state, other);
+        record(state, repeatedAutoplay);
 
-        const selection = selector.selectCandidate(last, [
-            batch(seed(last), [contextOnly, shared]),
-            batch(seed(manual, 'manual', 0.8), [manualOnly, shared])
+        const seeds = new AutoplaySelector().selectSeeds(state);
+
+        expect(seeds).toHaveLength(2);
+        expect(seeds[0]).toEqual(expect.objectContaining({
+            track: repeatedAutoplay,
+            source: 'autoplay',
+            weight: 1 + 0.75 ** 2
+        }));
+        expect(seeds[1]).toEqual(expect.objectContaining({
+            track: other,
+            weight: 0.75
+        }));
+    });
+
+    it('promotes candidates supported by several recent seeds', () => {
+        const state = history();
+        const newest = seed(track('newest', true), 1);
+        const previous = seed(track('previous'), 0.75);
+        const single = track('single', true);
+        const shared = track('shared', true);
+        const selector = new AutoplaySelector(new SequenceEntropy([0]));
+
+        const selection = selector.selectCandidate([
+            batch(newest, [single, shared]),
+            batch(previous, [shared])
         ], state);
 
         expect(selection?.track).toBe(shared);
-        expect(selection?.seedSources).toEqual(['context', 'manual']);
-        expect(selection?.youtubeScore).toBeGreaterThan(0.1);
+        expect(selection?.seedSources).toEqual(['autoplay', 'manual']);
+        expect(selection?.youtubeScore).toBeGreaterThan(0.16);
     });
 
-    it('keeps YouTube relevance dominant while applying a soft play penalty', () => {
+    it('softly penalizes plays outside the hard-exclusion horizon', () => {
         const state = history();
-        const last = track('last', true);
         const repeated = track('repeated', true);
         const fresh = track('fresh', true);
-        const excluded = Array.from(
-            { length: 48 },
-            (_, index) => track(`excluded-${index}`, true)
-        );
-
-        state.tracks.record(getMediaKey(repeated));
+        record(state, repeated);
         for (let index = 0; index < 50; index++) {
-            state.tracks.record(getMediaKey(track(`history-${index}`, true)));
+            record(state, track(`history-${index}`, true));
         }
-        for (const candidate of excluded) state.tracks.record(getMediaKey(candidate));
 
-        const selector = new AutoplaySelector(new SequenceEntropy([0]));
-        const selection = selector.selectCandidate(
-            last,
-            [batch(seed(last), [repeated, ...excluded, fresh])],
-            state
-        );
+        const selection = new AutoplaySelector(new SequenceEntropy([0])).selectCandidate([
+            batch(seed(track('seed', true)), [repeated, fresh])
+        ], state);
 
-        expect(selection?.track).toBe(repeated);
-        expect(selection?.playCount).toBe(1);
+        expect(selection?.track).toBe(fresh);
+        expect(selection?.playCount).toBe(0);
     });
 
-    it('softly penalizes repeated actual playback transitions', () => {
+    it('limits the entropy draw to the twenty highest-scoring candidates', () => {
         const state = history();
-        const last = track('last', true);
-        const repeated = track('repeated', true);
-        const alternate = track('alternate', true);
-        state.transitionCounts.push(getTransitionKey(getMediaKey(last), getMediaKey(repeated)));
+        const candidates = Array.from({ length: 25 }, (_, index) => track(`candidate-${index}`, true));
+        const selector = new AutoplaySelector(new SequenceEntropy([0.999999]));
 
-        const selector = new AutoplaySelector(new SequenceEntropy([0.5]));
-        const selection = selector.selectCandidate(
-            last,
-            [batch(seed(last), [repeated, alternate])],
-            state
-        );
+        const selection = selector.selectCandidate([
+            batch(seed(track('seed', true)), candidates)
+        ], state);
 
-        expect(selection?.track).toBe(alternate);
-        expect(selection?.transitionCount).toBe(0);
+        expect(Number(selection?.track.id.split('-').at(-1))).toBeLessThan(20);
     });
 
-    it('hard-excludes recent tracks and consumes entropy only for the final draw', () => {
+    it('hard-excludes recent tracks and consumes entropy only for a real draw', () => {
         const state = history();
-        const last = track('last', true);
         const candidates = [track('one', true), track('two', true)];
-        for (const candidate of candidates) state.tracks.record(getMediaKey(candidate));
+        for (const candidate of candidates) record(state, candidate);
         const entropy = new SequenceEntropy([0.5]);
         const selector = new AutoplaySelector(entropy);
 
-        selector.selectSeedPlan(last, state);
-        expect(selector.selectCandidate(
-            last,
-            [batch(seed(last), candidates)],
-            state
-        )).toBeUndefined();
+        expect(selector.selectCandidate([
+            batch(seed(track('seed', true)), candidates)
+        ], state)).toBeUndefined();
         expect(entropy.calls).toBe(0);
 
         const fresh = track('fresh', true);
-        expect(selector.selectCandidate(
-            last,
-            [batch(seed(last), [fresh])],
-            state
-        )?.track).toBe(fresh);
+        expect(selector.selectCandidate([
+            batch(seed(track('seed', true)), [fresh])
+        ], state)?.track).toBe(fresh);
         expect(entropy.calls).toBe(1);
     });
 });

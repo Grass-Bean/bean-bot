@@ -19,14 +19,11 @@ import {
     AUTOPLAY_CANDIDATE_CACHE_SIZE,
     AUTOPLAY_CANDIDATE_CACHE_TTL_MS,
     AUTOPLAY_CANDIDATE_LIMIT,
-    AUTOPLAY_MANUAL_SEED_WINDOW_SIZE,
     AUTOPLAY_PLAY_COUNT_WINDOW_SIZE,
-    AUTOPLAY_RECENT_TRACK_WINDOW_SIZE,
-    AUTOPLAY_TRANSITION_WINDOW_SIZE
+    AUTOPLAY_RECENT_TRACK_WINDOW_SIZE
 } from './autoplayConstants.js';
-import { CountedSlidingWindow, UniqueSlidingWindow } from './SlidingWindow.js';
 import { TrackPlaybackHistory } from './TrackPlaybackHistory.js';
-import { getMediaKey, getTransitionKey } from './mediaIdentity.js';
+import { getMediaKey } from './mediaIdentity.js';
 import type {
     AutoplayCandidateBatch,
     AutoplaySeed,
@@ -139,18 +136,13 @@ export class GuildAudioSessionManager {
             transition: Promise.resolve(),
             autoplayEnabled: false,
             autoplayHistory: {
-                tracks: new TrackPlaybackHistory<string>(
+                tracks: new TrackPlaybackHistory(
                     AUTOPLAY_RECENT_TRACK_WINDOW_SIZE,
                     AUTOPLAY_PLAY_COUNT_WINDOW_SIZE
-                ),
-                transitionCounts: new CountedSlidingWindow<string>(AUTOPLAY_TRANSITION_WINDOW_SIZE),
-                manualSeeds: new UniqueSlidingWindow<string, TrackMetadata>(
-                    AUTOPLAY_MANUAL_SEED_WINDOW_SIZE
-                ),
-                autoplayTracksSinceManualAnchor: 0,
-                manualSeedCursor: 0
+                )
             },
             autoplayCandidateCache: new Map(),
+            autoplayCandidateLookups: new Map(),
             hasBeenReady: connection.state.status === VoiceConnectionStatus.Ready,
             closing: false
         };
@@ -274,6 +266,7 @@ export class GuildAudioSessionManager {
         session.autoplayEnabled = enabled;
         if (!enabled) {
             session.autoplayController?.abort();
+            this.cancelAutoplayCandidateLookups(session);
             if (!session.current) {
                 void this.schedule(session, () => this.startNext(session));
             }
@@ -281,6 +274,7 @@ export class GuildAudioSessionManager {
         }
 
         this.clearInactivityTimer(session);
+        this.prefetchAutoplaySeeds(session);
         if (session.current?.metadata.kind === 'elevator') {
             const elevator = session.current;
             session.player.stop();
@@ -529,6 +523,7 @@ export class GuildAudioSessionManager {
         this.cancelRecovery(session);
         session.autoplayController?.abort();
         session.autoplayController = undefined;
+        this.cancelAutoplayCandidateLookups(session);
         session.autoplayCandidateCache.clear();
 
         session.player.removeAllListeners();
@@ -595,11 +590,8 @@ export class GuildAudioSessionManager {
 
         let resource: BeanAudioResource | undefined;
         try {
-            const seedPlan = this.autoplaySelector.selectSeedPlan(
-                lastTrack,
-                session.autoplayHistory
-            );
-            const resolutions = await Promise.all(seedPlan.seeds.map(seed => (
+            const seeds = this.autoplaySelector.selectSeeds(session.autoplayHistory);
+            const resolutions = await Promise.all(seeds.map(seed => (
                 this.resolveAutoplaySeed(session, seed, controller.signal)
             )));
 
@@ -614,7 +606,6 @@ export class GuildAudioSessionManager {
 
             const batches = resolutions.flatMap(({ batch }) => batch ? [batch] : []);
             const selection = this.autoplaySelector.selectCandidate(
-                lastTrack,
                 batches,
                 session.autoplayHistory
             );
@@ -634,7 +625,6 @@ export class GuildAudioSessionManager {
             session.current = resource;
             session.player.play(resource);
             this.recordStartedTrack(session, track);
-            this.autoplaySelector.commitSeedPlan(session.autoplayHistory, seedPlan);
             this.startTrackWatchdog(session, resource);
             this.notify(session, {
                 embeds: [createNowPlayingEmbed(track, session.queue.size())]
@@ -658,22 +648,81 @@ export class GuildAudioSessionManager {
         seed: AutoplaySeed,
         signal: AbortSignal
     ): Promise<AutoplaySeedResolution> {
-        const cached = this.getCachedAutoplayCandidates(session, seed.mediaKey);
-        if (cached) return { batch: { seed, candidates: cached } };
-
         try {
-            const candidates = await this.autoplayResolver.resolveAutoplayCandidates(
-                seed.track,
-                AUTOPLAY_CANDIDATE_LIMIT,
-                signal
-            );
+            const candidates = await this.getOrStartAutoplayCandidateLookup(session, seed.track);
             if (signal.aborted) return {};
-            if (candidates.length > 0) {
-                this.cacheAutoplayCandidates(session, seed.mediaKey, candidates);
-            }
             return { batch: { seed, candidates } };
         } catch (error) {
             return signal.aborted ? {} : { error };
+        }
+    }
+
+    private getOrStartAutoplayCandidateLookup(
+        session: GuildAudioSession,
+        seed: TrackMetadata
+    ): Promise<readonly TrackMetadata[]> {
+        const seedKey = getMediaKey(seed);
+        const cached = this.getCachedAutoplayCandidates(session, seedKey);
+        if (cached) return Promise.resolve(cached);
+
+        const active = session.autoplayCandidateLookups.get(seedKey);
+        if (active) return active.promise;
+
+        const controller = new AbortController();
+        const lookup = {
+            controller,
+            promise: Promise.resolve<readonly TrackMetadata[]>([])
+        };
+        lookup.promise = this.autoplayResolver.resolveAutoplayCandidates(
+            seed,
+            AUTOPLAY_CANDIDATE_LIMIT,
+            controller.signal
+        ).then(candidates => {
+            if (!controller.signal.aborted && candidates.length > 0) {
+                this.cacheAutoplayCandidates(session, seedKey, candidates);
+            }
+            return controller.signal.aborted ? [] : candidates;
+        }).finally(() => {
+            if (session.autoplayCandidateLookups.get(seedKey) === lookup) {
+                session.autoplayCandidateLookups.delete(seedKey);
+            }
+        });
+        session.autoplayCandidateLookups.set(seedKey, lookup);
+        void lookup.promise.catch(() => undefined);
+        return lookup.promise;
+    }
+
+    private prefetchAutoplaySeeds(session: GuildAudioSession): void {
+        if (!session.autoplayEnabled || session.closing) return;
+
+        for (const seed of this.autoplaySelector.selectSeeds(session.autoplayHistory)) {
+            void this.getOrStartAutoplayCandidateLookup(session, seed.track).catch(error => {
+                if (session.autoplayEnabled && !session.closing) {
+                    console.error(
+                        `Failed to prefetch autoplay candidates for ${seed.track.title} ` +
+                        `in guild ${session.guildId}:`,
+                        error
+                    );
+                }
+            });
+        }
+    }
+
+    private cancelAutoplayCandidateLookups(session: GuildAudioSession): void {
+        for (const lookup of session.autoplayCandidateLookups.values()) {
+            lookup.controller.abort();
+        }
+        session.autoplayCandidateLookups.clear();
+    }
+
+    private pruneAutoplayCandidateLookups(session: GuildAudioSession): void {
+        const retainedKeys = new Set(
+            this.autoplaySelector.selectSeeds(session.autoplayHistory).map(seed => seed.mediaKey)
+        );
+        for (const [seedKey, lookup] of session.autoplayCandidateLookups) {
+            if (retainedKeys.has(seedKey)) continue;
+            lookup.controller.abort();
+            session.autoplayCandidateLookups.delete(seedKey);
         }
     }
 
@@ -715,21 +764,25 @@ export class GuildAudioSessionManager {
         track: TrackMetadata
     ): void {
         const mediaKey = getMediaKey(track);
-        const previousTrack = session.lastTrack;
-        session.autoplayHistory.tracks.record(mediaKey);
-
-        if (previousTrack) {
-            session.autoplayHistory.transitionCounts.push(
-                getTransitionKey(getMediaKey(previousTrack), mediaKey)
-            );
-        }
-
-        if (!track.autoplay) {
-            session.autoplayHistory.manualSeeds.push(mediaKey, { ...track });
-            this.autoplaySelector.resetSeedSchedule(session.autoplayHistory);
-        }
+        session.autoplayHistory.tracks.record({
+            mediaKey,
+            track: { ...track },
+            source: track.autoplay ? 'autoplay' : 'manual'
+        });
 
         session.lastTrack = track;
+        this.pruneAutoplayCandidateLookups(session);
+        if (session.autoplayEnabled) {
+            void this.getOrStartAutoplayCandidateLookup(session, track).catch(error => {
+                if (session.autoplayEnabled && !session.closing) {
+                    console.error(
+                        `Failed to prefetch autoplay candidates for ${track.title} ` +
+                        `in guild ${session.guildId}:`,
+                        error
+                    );
+                }
+            });
+        }
     }
 
     private takePreload(session: GuildAudioSession, track: TrackMetadata): BeanAudioResource | undefined {

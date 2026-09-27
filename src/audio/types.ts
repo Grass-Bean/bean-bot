@@ -6,9 +6,8 @@ import type {
 import type { TextChannel } from 'discord.js';
 import type { Readable } from 'node:stream';
 import type { Deque } from './Deque.js';
-import type { CountedSlidingWindow, UniqueSlidingWindow } from './SlidingWindow.js';
 import type { TrackPlaybackHistory } from './TrackPlaybackHistory.js';
-import type { MediaKey, TransitionKey } from './mediaIdentity.js';
+import type { MediaKey } from './mediaIdentity.js';
 
 export interface TrackMetadata {
     kind: 'track';
@@ -21,23 +20,25 @@ export interface TrackMetadata {
     autoplay?: boolean;
 }
 
+export type TrackPlaybackSource = 'manual' | 'autoplay';
+
+export interface TrackPlaybackEntry {
+    mediaKey: MediaKey;
+    track: TrackMetadata;
+    source: TrackPlaybackSource;
+}
+
 export interface EntropySource {
     next(): number;
 }
 
-export type AutoplaySeedSource = 'context' | 'manual';
+export type AutoplaySeedSource = TrackPlaybackSource;
 
 export interface AutoplaySeed {
     track: TrackMetadata;
     mediaKey: MediaKey;
     source: AutoplaySeedSource;
     weight: number;
-}
-
-export interface AutoplaySeedPlan {
-    seeds: readonly AutoplaySeed[];
-    manualAnchorApplied: boolean;
-    manualSeedCount: number;
 }
 
 export interface AutoplayCandidateBatch {
@@ -51,7 +52,6 @@ export interface AutoplaySelection {
     youtubeRank: number;
     seedSources: readonly AutoplaySeedSource[];
     playCount: number;
-    transitionCount: number;
     youtubeScore: number;
     finalScore: number;
 }
@@ -106,22 +106,24 @@ export interface GuildAudioSession {
     autoplayController?: AbortController;
     autoplayHistory: AutoplaySessionHistory;
     autoplayCandidateCache: Map<MediaKey, AutoplayCandidateCacheEntry>;
+    autoplayCandidateLookups: Map<MediaKey, AutoplayCandidateLookup>;
     recovery?: VoiceRecovery;
     hasBeenReady: boolean;
     closing: boolean;
 }
 
 export interface AutoplaySessionHistory {
-    tracks: TrackPlaybackHistory<MediaKey>;
-    transitionCounts: CountedSlidingWindow<TransitionKey>;
-    manualSeeds: UniqueSlidingWindow<MediaKey, TrackMetadata>;
-    autoplayTracksSinceManualAnchor: number;
-    manualSeedCursor: number;
+    tracks: TrackPlaybackHistory;
 }
 
 export interface AutoplayCandidateCacheEntry {
     candidates: readonly TrackMetadata[];
     expiresAt: number;
+}
+
+export interface AutoplayCandidateLookup {
+    controller: AbortController;
+    promise: Promise<readonly TrackMetadata[]>;
 }
 
 export interface AutoplayTrackResolver {
