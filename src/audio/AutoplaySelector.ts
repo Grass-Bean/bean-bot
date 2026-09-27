@@ -5,7 +5,9 @@ import {
     AUTOPLAY_RECIPROCAL_RANK_OFFSET,
     AUTOPLAY_SEED_RECENCY_DECAY,
     AUTOPLAY_SEED_WINDOW_SIZE,
-    AUTOPLAY_SELECTION_POOL_SIZE
+    AUTOPLAY_SELECTION_POOL_SIZE,
+    AUTOPLAY_SELECTION_RANK_DECAY,
+    AUTOPLAY_SELECTION_SHARPNESS
 } from './autoplayConstants.js';
 import { getMediaKey, type MediaKey } from './mediaIdentity.js';
 import { TrackPlaybackScope } from './TrackPlaybackHistory.js';
@@ -104,7 +106,7 @@ export class AutoplaySelector {
             });
         }
 
-        const ranked = [...accumulated.values()].map((candidate): RankedCandidate => {
+        const ranked = [...accumulated.values()].map((candidate): AutoplaySelection => {
             const playCount = history.tracks.count(
                 TrackPlaybackScope.PlayCount,
                 candidate.mediaKey
@@ -122,14 +124,21 @@ export class AutoplaySelector {
                 seedSources: [...candidate.seedSources],
                 playCount,
                 youtubeScore: candidate.youtubeScore,
-                finalScore,
-                selectionWeight: finalScore
+                finalScore
             };
         }).sort((left, right) => right.finalScore - left.finalScore)
             .slice(0, AUTOPLAY_SELECTION_POOL_SIZE);
 
         if (ranked.length === 0) return undefined;
-        const selected = this.weightedPick(ranked);
+        const maximumFinalScore = ranked[0].finalScore;
+        const weighted = ranked.map((candidate, rank): RankedCandidate => ({
+            ...candidate,
+            selectionWeight: Math.pow(
+                candidate.finalScore / maximumFinalScore,
+                AUTOPLAY_SELECTION_SHARPNESS
+            ) * Math.exp(-AUTOPLAY_SELECTION_RANK_DECAY * rank)
+        }));
+        const selected = this.weightedPick(weighted);
         const { selectionWeight: _, ...selection } = selected;
         return selection;
     }

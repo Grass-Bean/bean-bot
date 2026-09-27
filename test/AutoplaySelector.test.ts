@@ -81,10 +81,10 @@ describe('AutoplaySelector', () => {
         ]);
         expect(seeds.map(value => value.weight)).toEqual([
             1,
-            0.75,
-            0.75 ** 2,
-            0.75 ** 3,
-            0.75 ** 4
+            0.5,
+            0.5 ** 2,
+            0.5 ** 3,
+            0.5 ** 4
         ]);
     });
 
@@ -103,18 +103,18 @@ describe('AutoplaySelector', () => {
         expect(seeds[0]).toEqual(expect.objectContaining({
             track: repeatedAutoplay,
             source: 'autoplay',
-            weight: 1 + 0.75 ** 2
+            weight: 1 + 0.5 ** 2
         }));
         expect(seeds[1]).toEqual(expect.objectContaining({
             track: other,
-            weight: 0.75
+            weight: 0.5
         }));
     });
 
     it('promotes candidates supported by several recent seeds', () => {
         const state = history();
         const newest = seed(track('newest', true), 1);
-        const previous = seed(track('previous'), 0.75);
+        const previous = seed(track('previous'), 0.5);
         const single = track('single', true);
         const shared = track('shared', true);
         const selector = new AutoplaySelector(new SequenceEntropy([0]));
@@ -126,7 +126,7 @@ describe('AutoplaySelector', () => {
 
         expect(selection?.track).toBe(shared);
         expect(selection?.seedSources).toEqual(['autoplay', 'manual']);
-        expect(selection?.youtubeScore).toBeGreaterThan(0.16);
+        expect(selection?.youtubeScore).toBeGreaterThan(0.14);
     });
 
     it('softly penalizes plays outside the hard-exclusion horizon', () => {
@@ -146,16 +146,32 @@ describe('AutoplaySelector', () => {
         expect(selection?.playCount).toBe(0);
     });
 
-    it('limits the entropy draw to the twenty highest-scoring candidates', () => {
+    it('uses one smooth entropy draw across the twenty highest-scoring candidates', () => {
         const state = history();
         const candidates = Array.from({ length: 25 }, (_, index) => track(`candidate-${index}`, true));
-        const selector = new AutoplaySelector(new SequenceEntropy([0.999999]));
+        const entropy = new SequenceEntropy([0.999999]);
+        const selector = new AutoplaySelector(entropy);
 
         const selection = selector.selectCandidate([
             batch(seed(track('seed', true)), candidates)
         ], state);
 
-        expect(Number(selection?.track.id.split('-').at(-1))).toBeLessThan(20);
+        expect(selection?.track.id).toBe('candidate-19');
+        expect(entropy.calls).toBe(1);
+    });
+
+    it('smoothly reduces selection likelihood without a rank-five boundary', () => {
+        const state = history();
+        const candidates = Array.from({ length: 25 }, (_, index) => track(`candidate-${index}`, true));
+        const selector = new AutoplaySelector(new SequenceEntropy([0.9]));
+
+        const selection = selector.selectCandidate([
+            batch(seed(track('seed', true)), candidates)
+        ], state);
+        const selectedRank = Number(selection?.track.id.split('-').at(-1));
+
+        expect(selectedRank).toBeGreaterThanOrEqual(5);
+        expect(selectedRank).toBeLessThan(20);
     });
 
     it('hard-excludes recent tracks and consumes entropy only for a real draw', () => {
