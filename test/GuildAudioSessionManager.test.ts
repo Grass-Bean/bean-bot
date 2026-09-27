@@ -351,7 +351,7 @@ describe('GuildAudioSessionManager', () => {
         expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({ metadata: related }));
     });
 
-    it('filters recent candidates and performs at most one alternate-seed lookup', async () => {
+    it('fuses context and manual seed lookups', async () => {
         const first = makeTrack('first');
         const second = makeTrack('second');
         const related = { ...makeTrack('related'), autoplay: true };
@@ -390,6 +390,58 @@ describe('GuildAudioSessionManager', () => {
         expect(autoplayResolver.resolveAutoplayCandidates.mock.calls[0]![0]).toBe(second);
         expect(autoplayResolver.resolveAutoplayCandidates.mock.calls[1]![0]).toEqual(first);
         expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({ metadata: related }));
+    });
+
+    it('reuses a bounded session candidate pool when a seed appears again', async () => {
+        const first = makeTrack('first');
+        const second = makeTrack('second');
+        const autoplayOne = { ...makeTrack('autoplay-one'), autoplay: true };
+        const autoplayTwo = { ...makeTrack('autoplay-two'), autoplay: true };
+        const manualCandidate = { ...makeTrack('manual-candidate'), autoplay: true };
+        const autoplayResolver = {
+            resolveAutoplayCandidates: vi.fn().mockImplementation((seed: TrackMetadata) => {
+                if (seed.id === 'second') return Promise.resolve([autoplayOne]);
+                if (seed.id === 'first') return Promise.resolve([manualCandidate]);
+                return Promise.resolve([autoplayTwo]);
+            })
+        };
+        manager = new GuildAudioSessionManager(
+            resources as unknown as AudioResourceManager,
+            300_000,
+            15_000,
+            15_000,
+            600_000,
+            20_000,
+            30_000,
+            5_000,
+            5_000,
+            60_000,
+            autoplayResolver as AutoplayTrackResolver,
+            new AutoplaySelector({ next: () => 0 })
+        );
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        manager.enqueue('guild-a', first, null);
+        manager.enqueue('guild-a', second, null);
+        await flushTransitions();
+        manager.setAutoplay('guild-a', true);
+
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+        expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({
+            metadata: autoplayOne
+        }));
+
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+
+        expect(autoplayResolver.resolveAutoplayCandidates).toHaveBeenCalledTimes(3);
+        expect(autoplayResolver.resolveAutoplayCandidates.mock.calls.map(call => call[0].id))
+            .toEqual(['second', 'first', 'autoplay-one']);
+        expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({
+            metadata: autoplayTwo
+        }));
     });
 
     it('finishes the current track before returning to elevator music when autoplay is disabled', async () => {

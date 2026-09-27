@@ -21,6 +21,41 @@ export interface TrackMetadata {
     autoplay?: boolean;
 }
 
+export interface EntropySource {
+    next(): number;
+}
+
+export type AutoplaySeedSource = 'context' | 'manual';
+
+export interface AutoplaySeed {
+    track: TrackMetadata;
+    mediaKey: MediaKey;
+    source: AutoplaySeedSource;
+    weight: number;
+}
+
+export interface AutoplaySeedPlan {
+    seeds: readonly AutoplaySeed[];
+    manualAnchorApplied: boolean;
+    manualSeedCount: number;
+}
+
+export interface AutoplayCandidateBatch {
+    seed: AutoplaySeed;
+    candidates: readonly TrackMetadata[];
+}
+
+export interface AutoplaySelection {
+    track: TrackMetadata;
+    mediaKey: MediaKey;
+    youtubeRank: number;
+    seedSources: readonly AutoplaySeedSource[];
+    playCount: number;
+    transitionCount: number;
+    youtubeScore: number;
+    finalScore: number;
+}
+
 export interface ElevatorMetadata {
     kind: 'elevator';
     id: 'elevator';
@@ -70,6 +105,7 @@ export interface GuildAudioSession {
     lastTrack?: TrackMetadata;
     autoplayController?: AbortController;
     autoplayHistory: AutoplaySessionHistory;
+    autoplayCandidateCache: Map<MediaKey, AutoplayCandidateCacheEntry>;
     recovery?: VoiceRecovery;
     hasBeenReady: boolean;
     closing: boolean;
@@ -79,6 +115,13 @@ export interface AutoplaySessionHistory {
     tracks: TrackPlaybackHistory<MediaKey>;
     transitionCounts: CountedSlidingWindow<TransitionKey>;
     manualSeeds: UniqueSlidingWindow<MediaKey, TrackMetadata>;
+    autoplayTracksSinceManualAnchor: number;
+    manualSeedCursor: number;
+}
+
+export interface AutoplayCandidateCacheEntry {
+    candidates: readonly TrackMetadata[];
+    expiresAt: number;
 }
 
 export interface AutoplayTrackResolver {
