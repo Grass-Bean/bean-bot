@@ -40,6 +40,7 @@ type FakeConnection = EventEmitter & {
     joinConfig: { channelId: string };
     subscribe: ReturnType<typeof vi.fn>;
     destroy: ReturnType<typeof vi.fn>;
+    rejoin: ReturnType<typeof vi.fn>;
 };
 
 type FakePlayer = EventEmitter & {
@@ -59,6 +60,7 @@ const createConnection = (
     };
     connection.joinConfig = { channelId };
     connection.subscribe = vi.fn();
+    connection.rejoin = vi.fn().mockReturnValue(true);
     connection.destroy = vi.fn(() => {
         connection.state = { status: VoiceConnectionStatus.Destroyed };
     });
@@ -673,12 +675,15 @@ describe('GuildAudioSessionManager', () => {
     });
 
     it('closes and notifies after transient recovery fails', async () => {
+        vi.useFakeTimers();
         const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        vi.spyOn(console, 'info').mockImplementation(() => undefined);
         const channel = { send: vi.fn().mockResolvedValue(undefined) } as any;
         await manager.connect('guild-a', 'voice-a', {} as any);
         manager.enqueue('guild-a', makeTrack('one'), channel);
         await flushTransitions();
-        entersStateMock.mockRejectedValueOnce(new Error('voice unavailable'));
+        entersStateMock.mockRejectedValue(new Error('voice unavailable'));
         const disconnected = {
             status: VoiceConnectionStatus.Disconnected,
             reason: VoiceConnectionDisconnectReason.WebSocketClose,
@@ -687,7 +692,10 @@ describe('GuildAudioSessionManager', () => {
         connection.state = disconnected;
         connection.emit('stateChange', {}, disconnected);
 
+        await vi.advanceTimersByTimeAsync(30_000);
         await vi.waitFor(() => expect(manager.getActiveChannelId('guild-a')).toBeUndefined());
+        expect(entersStateMock).toHaveBeenCalledTimes(5);
+        expect(connection.rejoin).toHaveBeenCalledTimes(4);
         expect(errorSpy).toHaveBeenCalledWith(
             expect.stringContaining('Voice connection recovery failed'),
             expect.any(Error)
@@ -695,6 +703,34 @@ describe('GuildAudioSessionManager', () => {
         expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
             content: expect.stringContaining('Voice connection lost')
         }));
+        expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
+            content: expect.stringContaining('about 2 minutes')
+        }));
+    });
+
+    it('recovers a transient outage on a later backoff attempt', async () => {
+        vi.useFakeTimers();
+        vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        vi.spyOn(console, 'info').mockImplementation(() => undefined);
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        entersStateMock
+            .mockRejectedValueOnce(new Error('voice unavailable'))
+            .mockRejectedValueOnce(new Error('voice unavailable'))
+            .mockResolvedValueOnce(connection);
+        const disconnected = {
+            status: VoiceConnectionStatus.Disconnected,
+            reason: VoiceConnectionDisconnectReason.WebSocketClose,
+            closeCode: 4015
+        };
+        connection.state = disconnected;
+        connection.emit('stateChange', {}, disconnected);
+
+        await vi.advanceTimersByTimeAsync(6_000);
+        await flushTransitions();
+
+        expect(connection.rejoin).toHaveBeenCalledTimes(2);
+        expect(manager.getActiveChannelId('guild-a')).toBe('voice-a');
+        expect(connection.destroy).not.toHaveBeenCalled();
     });
 
     it('closes after failed external-disconnect recovery', async () => {

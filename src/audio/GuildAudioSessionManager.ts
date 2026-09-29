@@ -59,6 +59,20 @@ const VOICE_CLOSE_CODE_DESCRIPTIONS: Readonly<Record<number, string>> = {
 };
 
 const TERMINAL_VOICE_CLOSE_CODES = new Set([4021, 4022]);
+const VOICE_RECOVERY_MAX_ATTEMPTS = 5;
+const VOICE_RECOVERY_INITIAL_BACKOFF_MS = 2_000;
+
+const getVoiceRecoveryBackoffMs = (attempt: number): number => (
+    attempt <= 1 ? 0 : VOICE_RECOVERY_INITIAL_BACKOFF_MS * (2 ** (attempt - 2))
+);
+
+const getVoiceRecoveryEstimateMinutes = (attemptTimeoutMs: number): number => Math.ceil((
+    VOICE_RECOVERY_MAX_ATTEMPTS * attemptTimeoutMs +
+    Array.from(
+        { length: VOICE_RECOVERY_MAX_ATTEMPTS },
+        (_, index) => getVoiceRecoveryBackoffMs(index + 1)
+    ).reduce((total, delayMs) => total + delayMs, 0)
+) / 60_000);
 
 interface AutoplaySeedResolution {
     batch?: AutoplayCandidateBatch;
@@ -404,16 +418,29 @@ export class GuildAudioSessionManager {
 
         recovery.promise = (async () => {
             try {
-                const timeoutMs = recoveryKind === 'external-disconnect'
-                    ? this.externalDisconnectGraceTimeoutMs
-                    : this.connectionRecoveryTimeoutMs;
-                const timeout = setTimeout(() => controller.abort(), timeoutMs);
-                timeout.unref();
-
-                try {
-                    await this.awaitReady(session, controller.signal);
-                } finally {
-                    clearTimeout(timeout);
+                if (recoveryKind === 'external-disconnect') {
+                    await this.awaitRecoveryAttempt(
+                        session,
+                        controller.signal,
+                        this.externalDisconnectGraceTimeoutMs
+                    );
+                } else {
+                    const estimateMinutes = getVoiceRecoveryEstimateMinutes(
+                        this.connectionRecoveryTimeoutMs
+                    );
+                    console.info(
+                        `Transient voice outage detected in guild ${session.guildId}; ` +
+                        `trying up to ${VOICE_RECOVERY_MAX_ATTEMPTS} recovery attempts over ` +
+                        `about ${estimateMinutes} minutes.`
+                    );
+                    this.notify(
+                        session,
+                        `⚠️ **Voice connection interrupted**\n` +
+                        `Discord may be having an outage. Retrying up to ` +
+                        `${VOICE_RECOVERY_MAX_ATTEMPTS} times over about ` +
+                        `${estimateMinutes} minutes.`
+                    );
+                    await this.retryTransientRecovery(session, recovery, controller.signal);
                 }
                 this.syncSessionChannel(session);
             } catch (error) {
@@ -443,6 +470,99 @@ export class GuildAudioSessionManager {
         })();
 
         return recovery.promise;
+    }
+
+    private async retryTransientRecovery(
+        session: GuildAudioSession,
+        recovery: VoiceRecovery,
+        signal: AbortSignal
+    ): Promise<void> {
+        let lastError: unknown = new Error('Voice connection did not become ready.');
+
+        for (let attempt = 1; attempt <= VOICE_RECOVERY_MAX_ATTEMPTS; attempt++) {
+            if (!this.isRecoveryActive(session, recovery) || signal.aborted) return;
+
+            const backoffMs = getVoiceRecoveryBackoffMs(attempt);
+            if (backoffMs > 0) {
+                console.info(
+                    `Voice recovery attempt ${attempt}/${VOICE_RECOVERY_MAX_ATTEMPTS} ` +
+                    `for guild ${session.guildId} starts in ${backoffMs / 1_000}s.`
+                );
+                if (!await this.waitForRecoveryDelay(backoffMs, signal)) return;
+
+                if (!this.isRecoveryActive(session, recovery)) return;
+            }
+
+            try {
+                if (attempt > 1 && !session.connection.rejoin()) {
+                    throw new Error('Discord rejected the voice rejoin request.');
+                }
+                console.info(
+                    `Voice recovery attempt ${attempt}/${VOICE_RECOVERY_MAX_ATTEMPTS} ` +
+                    `for guild ${session.guildId}.`
+                );
+                await this.awaitRecoveryAttempt(
+                    session,
+                    signal,
+                    this.connectionRecoveryTimeoutMs
+                );
+                return;
+            } catch (error) {
+                if (!this.isRecoveryActive(session, recovery) || signal.aborted) return;
+                lastError = error;
+                console.warn(
+                    `Voice recovery attempt ${attempt}/${VOICE_RECOVERY_MAX_ATTEMPTS} ` +
+                    `failed in guild ${session.guildId}:`,
+                    error
+                );
+            }
+        }
+
+        throw lastError;
+    }
+
+    private async awaitRecoveryAttempt(
+        session: GuildAudioSession,
+        recoverySignal: AbortSignal,
+        timeoutMs: number
+    ): Promise<void> {
+        const attemptController = new AbortController();
+        const abortAttempt = () => attemptController.abort();
+        recoverySignal.addEventListener('abort', abortAttempt, { once: true });
+
+        const timeout = setTimeout(abortAttempt, timeoutMs);
+        timeout.unref();
+
+        try {
+            await this.awaitReady(session, attemptController.signal);
+        } finally {
+            clearTimeout(timeout);
+            recoverySignal.removeEventListener('abort', abortAttempt);
+        }
+    }
+
+    private waitForRecoveryDelay(delayMs: number, signal: AbortSignal): Promise<boolean> {
+        if (signal.aborted) return Promise.resolve(false);
+
+        return new Promise(resolve => {
+            const finish = (elapsed: boolean) => {
+                clearTimeout(timeout);
+                signal.removeEventListener('abort', handleAbort);
+                resolve(elapsed);
+            };
+            const handleAbort = () => finish(false);
+            const timeout = setTimeout(() => finish(true), delayMs);
+            timeout.unref();
+            signal.addEventListener('abort', handleAbort, { once: true });
+        });
+    }
+
+    private isRecoveryActive(session: GuildAudioSession, recovery: VoiceRecovery): boolean {
+        return (
+            session.recovery === recovery &&
+            this.sessions.get(session.guildId) === session &&
+            !session.closing
+        );
     }
 
     private observeNetworkingClose(
