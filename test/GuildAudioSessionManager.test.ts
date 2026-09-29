@@ -25,6 +25,7 @@ import {
 } from '@discordjs/voice';
 import {
     GuildAudioSessionManager,
+    type GuildAudioSessionManagerOptions,
     VoiceConnectionRateLimitError
 } from '../src/audio/GuildAudioSessionManager.js';
 import { AutoplaySelector } from '../src/audio/AutoplaySelector.js';
@@ -118,6 +119,13 @@ describe('GuildAudioSessionManager', () => {
     let resources: ReturnType<typeof createResources>;
     let manager: GuildAudioSessionManager;
 
+    const createManager = (options: GuildAudioSessionManagerOptions = {}) => (
+        new GuildAudioSessionManager({
+            resources: resources as unknown as AudioResourceManager,
+            ...options
+        })
+    );
+
     beforeEach(() => {
         vi.clearAllMocks();
         connection = createConnection();
@@ -126,18 +134,7 @@ describe('GuildAudioSessionManager', () => {
         joinMock.mockReturnValue(connection);
         playerFactoryMock.mockReturnValue(player);
         entersStateMock.mockImplementation(async (target) => target);
-        manager = new GuildAudioSessionManager(
-            resources as unknown as AudioResourceManager,
-            300_000,
-            15_000,
-            15_000,
-            600_000,
-            20_000,
-            30_000,
-            5_000,
-            5_000,
-            60_000
-        );
+        manager = createManager();
     });
 
     afterEach(() => {
@@ -282,19 +279,9 @@ describe('GuildAudioSessionManager', () => {
         const autoplayResolver = {
             resolveAutoplayCandidates: vi.fn().mockResolvedValue([related])
         };
-        manager = new GuildAudioSessionManager(
-            resources as unknown as AudioResourceManager,
-            300_000,
-            15_000,
-            15_000,
-            600_000,
-            20_000,
-            30_000,
-            5_000,
-            5_000,
-            60_000,
-            autoplayResolver as AutoplayTrackResolver
-        );
+        manager = createManager({
+            autoplayResolver: autoplayResolver as AutoplayTrackResolver
+        });
         await manager.connect('guild-a', 'voice-a', {} as any);
         expect(manager.isAutoplayEnabled('guild-a')).toBe(false);
 
@@ -321,19 +308,9 @@ describe('GuildAudioSessionManager', () => {
         const autoplayResolver = {
             resolveAutoplayCandidates: vi.fn().mockResolvedValue([related])
         };
-        manager = new GuildAudioSessionManager(
-            resources as unknown as AudioResourceManager,
-            300_000,
-            15_000,
-            15_000,
-            600_000,
-            20_000,
-            30_000,
-            5_000,
-            5_000,
-            60_000,
-            autoplayResolver as AutoplayTrackResolver
-        );
+        manager = createManager({
+            autoplayResolver: autoplayResolver as AutoplayTrackResolver
+        });
         await manager.connect('guild-a', 'voice-a', {} as any);
         manager.enqueue('guild-a', makeTrack('seed'), null);
         await flushTransitions();
@@ -353,6 +330,29 @@ describe('GuildAudioSessionManager', () => {
         expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({ metadata: related }));
     });
 
+    it('preserves the inactivity deadline when autoplay has no playback history', async () => {
+        vi.useFakeTimers();
+        const autoplayResolver = {
+            resolveAutoplayCandidates: vi.fn().mockResolvedValue([])
+        };
+        manager = createManager({
+            autoplayResolver: autoplayResolver as AutoplayTrackResolver,
+            inactivityTimeoutMs: 20,
+            emptySessionTimeoutMs: 10
+        });
+        await manager.connect('guild-a', 'voice-a', {} as any);
+
+        manager.setAutoplay('guild-a', true);
+        await flushTransitions();
+        await vi.advanceTimersByTimeAsync(10);
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+        await vi.advanceTimersByTimeAsync(10);
+
+        expect(autoplayResolver.resolveAutoplayCandidates).not.toHaveBeenCalled();
+        expect(manager.getActiveChannelId('guild-a')).toBeUndefined();
+    });
+
     it('aggregates cached lookups from recent playback seeds', async () => {
         const first = makeTrack('first');
         const second = makeTrack('second');
@@ -364,20 +364,10 @@ describe('GuildAudioSessionManager', () => {
                 .mockResolvedValue([])
         };
         const selector = new AutoplaySelector({ next: () => 0.99 });
-        manager = new GuildAudioSessionManager(
-            resources as unknown as AudioResourceManager,
-            300_000,
-            15_000,
-            15_000,
-            600_000,
-            20_000,
-            30_000,
-            5_000,
-            5_000,
-            60_000,
-            autoplayResolver as AutoplayTrackResolver,
-            selector
-        );
+        manager = createManager({
+            autoplayResolver: autoplayResolver as AutoplayTrackResolver,
+            autoplaySelector: selector
+        });
         await manager.connect('guild-a', 'voice-a', {} as any);
         manager.enqueue('guild-a', first, null);
         manager.enqueue('guild-a', second, null);
@@ -409,20 +399,10 @@ describe('GuildAudioSessionManager', () => {
                 return Promise.resolve([autoplayTwo]);
             })
         };
-        manager = new GuildAudioSessionManager(
-            resources as unknown as AudioResourceManager,
-            300_000,
-            15_000,
-            15_000,
-            600_000,
-            20_000,
-            30_000,
-            5_000,
-            5_000,
-            60_000,
-            autoplayResolver as AutoplayTrackResolver,
-            new AutoplaySelector({ next: () => 0 })
-        );
+        manager = createManager({
+            autoplayResolver: autoplayResolver as AutoplayTrackResolver,
+            autoplaySelector: new AutoplaySelector({ next: () => 0 })
+        });
         await manager.connect('guild-a', 'voice-a', {} as any);
         manager.enqueue('guild-a', first, null);
         manager.enqueue('guild-a', second, null);
@@ -453,19 +433,9 @@ describe('GuildAudioSessionManager', () => {
         const autoplayResolver = {
             resolveAutoplayCandidates: vi.fn().mockResolvedValue([related])
         };
-        manager = new GuildAudioSessionManager(
-            resources as unknown as AudioResourceManager,
-            300_000,
-            15_000,
-            15_000,
-            600_000,
-            20_000,
-            30_000,
-            5_000,
-            5_000,
-            60_000,
-            autoplayResolver as AutoplayTrackResolver
-        );
+        manager = createManager({
+            autoplayResolver: autoplayResolver as AutoplayTrackResolver
+        });
         await manager.connect('guild-a', 'voice-a', {} as any);
         manager.enqueue('guild-a', makeTrack('seed'), null);
         await flushTransitions();
@@ -831,13 +801,10 @@ describe('GuildAudioSessionManager', () => {
 
     it('disconnects an empty session after its initial inactivity timeout', async () => {
         vi.useFakeTimers();
-        manager = new GuildAudioSessionManager(
-            resources as unknown as AudioResourceManager,
-            20,
-            15_000,
-            15_000,
-            10
-        );
+        manager = createManager({
+            inactivityTimeoutMs: 20,
+            emptySessionTimeoutMs: 10
+        });
         await manager.connect('guild-a', 'voice-a', {} as any);
 
         await vi.advanceTimersByTimeAsync(10);
@@ -847,13 +814,10 @@ describe('GuildAudioSessionManager', () => {
 
     it('cancels the initial timeout while playing and starts a fresh timeout when the queue ends', async () => {
         vi.useFakeTimers();
-        manager = new GuildAudioSessionManager(
-            resources as unknown as AudioResourceManager,
-            20,
-            15_000,
-            15_000,
-            10
-        );
+        manager = createManager({
+            inactivityTimeoutMs: 20,
+            emptySessionTimeoutMs: 10
+        });
         const channel = { send: vi.fn().mockResolvedValue(undefined) } as any;
         await manager.connect('guild-a', 'voice-a', {} as any);
         manager.enqueue('guild-a', makeTrack('one'), channel);
@@ -874,16 +838,11 @@ describe('GuildAudioSessionManager', () => {
 
     it('watchdog stops a track that never starts and falls back when stop returns false', async () => {
         vi.useFakeTimers();
-        manager = new GuildAudioSessionManager(
-            resources as unknown as AudioResourceManager,
-            300_000,
-            15_000,
-            15_000,
-            600_000,
-            10,
-            20,
-            5
-        );
+        manager = createManager({
+            trackStartupTimeoutMs: 10,
+            trackStallTimeoutMs: 20,
+            trackWatchdogIntervalMs: 5
+        });
         const channel = { send: vi.fn().mockResolvedValue(undefined) } as any;
         player.play.mockImplementation(() => {
             player.state = { status: AudioPlayerStatus.Buffering };
@@ -905,16 +864,11 @@ describe('GuildAudioSessionManager', () => {
 
     it('watchdog stops playback that stops making progress and lets idle release it', async () => {
         vi.useFakeTimers();
-        manager = new GuildAudioSessionManager(
-            resources as unknown as AudioResourceManager,
-            300_000,
-            15_000,
-            15_000,
-            600_000,
-            10,
-            10,
-            5
-        );
+        manager = createManager({
+            trackStartupTimeoutMs: 10,
+            trackStallTimeoutMs: 10,
+            trackWatchdogIntervalMs: 5
+        });
         const channel = { send: vi.fn().mockResolvedValue(undefined) } as any;
         await manager.connect('guild-a', 'voice-a', {} as any);
         manager.enqueue('guild-a', makeTrack('one'), channel);
@@ -936,16 +890,11 @@ describe('GuildAudioSessionManager', () => {
 
     it('watchdog stops a track that stalls after entering a non-playing state', async () => {
         vi.useFakeTimers();
-        manager = new GuildAudioSessionManager(
-            resources as unknown as AudioResourceManager,
-            300_000,
-            15_000,
-            15_000,
-            600_000,
-            10,
-            10,
-            5
-        );
+        manager = createManager({
+            trackStartupTimeoutMs: 10,
+            trackStallTimeoutMs: 10,
+            trackWatchdogIntervalMs: 5
+        });
         const channel = { send: vi.fn().mockResolvedValue(undefined) } as any;
         await manager.connect('guild-a', 'voice-a', {} as any);
         manager.enqueue('guild-a', makeTrack('one'), channel);
@@ -965,16 +914,11 @@ describe('GuildAudioSessionManager', () => {
 
     it('watchdog stops a progressing track after its duration safety limit', async () => {
         vi.useFakeTimers();
-        manager = new GuildAudioSessionManager(
-            resources as unknown as AudioResourceManager,
-            300_000,
-            15_000,
-            15_000,
-            600_000,
-            10,
-            100_000,
-            20_000
-        );
+        manager = createManager({
+            trackStartupTimeoutMs: 10,
+            trackStallTimeoutMs: 100_000,
+            trackWatchdogIntervalMs: 20_000
+        });
         const channel = { send: vi.fn().mockResolvedValue(undefined) } as any;
         await manager.connect('guild-a', 'voice-a', {} as any);
         manager.enqueue('guild-a', makeTrack('one', 1), channel);

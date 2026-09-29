@@ -101,12 +101,7 @@ export interface GuildAudioSession {
     trackWatchdog?: NodeJS.Timeout;
     announcementChannel: TextChannel | null;
     transition: Promise<void>;
-    autoplayEnabled: boolean;
-    lastTrack?: TrackMetadata;
-    autoplayController?: AbortController;
-    autoplayHistory: AutoplaySessionHistory;
-    autoplayCandidateCache: Map<MediaKey, AutoplayCandidateCacheEntry>;
-    autoplayCandidateLookups: Map<MediaKey, AutoplayCandidateLookup>;
+    autoplay: AutoplaySessionState;
     recovery?: VoiceRecovery;
     hasBeenReady: boolean;
     closing: boolean;
@@ -114,6 +109,14 @@ export interface GuildAudioSession {
 
 export interface AutoplaySessionHistory {
     tracks: TrackPlaybackHistory;
+}
+
+export interface AutoplaySessionState {
+    enabled: boolean;
+    controller?: AbortController;
+    history: AutoplaySessionHistory;
+    candidateCache: Map<MediaKey, AutoplayCandidateCacheEntry>;
+    candidateLookups: Map<MediaKey, AutoplayCandidateLookup>;
 }
 
 export interface AutoplayCandidateCacheEntry {

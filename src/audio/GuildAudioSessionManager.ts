@@ -12,21 +12,12 @@ import {
 import { escapeMarkdown, TextChannel, type MessageCreateOptions } from 'discord.js';
 import { Deque, MAX_QUEUE_SIZE } from './Deque.js';
 import { audioResourceManager, AudioResourceManager } from './AudioResourceManager.js';
+import { AutoplayCoordinator } from './AutoplayCoordinator.js';
 import { createNowPlayingEmbed } from './audioPresentation.js';
 import { trackResolver } from './TrackResolver.js';
 import { AutoplaySelector } from './AutoplaySelector.js';
-import {
-    AUTOPLAY_CANDIDATE_CACHE_SIZE,
-    AUTOPLAY_CANDIDATE_CACHE_TTL_MS,
-    AUTOPLAY_CANDIDATE_LIMIT,
-    AUTOPLAY_PLAY_COUNT_WINDOW_SIZE,
-    AUTOPLAY_RECENT_TRACK_WINDOW_SIZE
-} from './autoplayConstants.js';
-import { TrackPlaybackHistory } from './TrackPlaybackHistory.js';
-import { getMediaKey } from './mediaIdentity.js';
+import { VoiceRecoveryPolicy } from './VoiceRecoveryPolicy.js';
 import type {
-    AutoplayCandidateBatch,
-    AutoplaySeed,
     AutoplayTrackResolver,
     AudioMetadata,
     AudioQueueSnapshot,
@@ -59,24 +50,22 @@ const VOICE_CLOSE_CODE_DESCRIPTIONS: Readonly<Record<number, string>> = {
 };
 
 const TERMINAL_VOICE_CLOSE_CODES = new Set([4021, 4022]);
-const VOICE_RECOVERY_MAX_ATTEMPTS = 5;
-const VOICE_RECOVERY_INITIAL_BACKOFF_MS = 2_000;
 
-const getVoiceRecoveryBackoffMs = (attempt: number): number => (
-    attempt <= 1 ? 0 : VOICE_RECOVERY_INITIAL_BACKOFF_MS * (2 ** (attempt - 2))
-);
-
-const getVoiceRecoveryEstimateMinutes = (attemptTimeoutMs: number): number => Math.ceil((
-    VOICE_RECOVERY_MAX_ATTEMPTS * attemptTimeoutMs +
-    Array.from(
-        { length: VOICE_RECOVERY_MAX_ATTEMPTS },
-        (_, index) => getVoiceRecoveryBackoffMs(index + 1)
-    ).reduce((total, delayMs) => total + delayMs, 0)
-) / 60_000);
-
-interface AutoplaySeedResolution {
-    batch?: AutoplayCandidateBatch;
-    error?: unknown;
+export interface GuildAudioSessionManagerOptions {
+    resources?: AudioResourceManager;
+    inactivityTimeoutMs?: number;
+    connectionReadyTimeoutMs?: number;
+    connectionRecoveryTimeoutMs?: number;
+    emptySessionTimeoutMs?: number;
+    trackStartupTimeoutMs?: number;
+    trackStallTimeoutMs?: number;
+    trackWatchdogIntervalMs?: number;
+    externalDisconnectGraceTimeoutMs?: number;
+    rateLimitCooldownMs?: number;
+    autoplayResolver?: AutoplayTrackResolver;
+    autoplaySelector?: AutoplaySelector;
+    autoplayCoordinator?: AutoplayCoordinator;
+    voiceRecoveryPolicy?: VoiceRecoveryPolicy;
 }
 
 export class VoiceConnectionRateLimitError extends Error {
@@ -90,21 +79,36 @@ export class GuildAudioSessionManager {
     private readonly sessions = new Map<string, GuildAudioSession>();
     private readonly observedNetworkingInstances = new WeakSet<object>();
     private readonly rateLimitCooldowns = new Map<string, number>();
+    private readonly resources: AudioResourceManager;
+    private readonly inactivityTimeoutMs: number;
+    private readonly connectionReadyTimeoutMs: number;
+    private readonly emptySessionTimeoutMs: number;
+    private readonly trackStartupTimeoutMs: number;
+    private readonly trackStallTimeoutMs: number;
+    private readonly trackWatchdogIntervalMs: number;
+    private readonly externalDisconnectGraceTimeoutMs: number;
+    private readonly rateLimitCooldownMs: number;
+    private readonly autoplayCoordinator: AutoplayCoordinator;
+    private readonly voiceRecoveryPolicy: VoiceRecoveryPolicy;
 
-    public constructor(
-        private readonly resources: AudioResourceManager = audioResourceManager,
-        private readonly inactivityTimeoutMs = 5 * 60 * 1000,
-        private readonly connectionReadyTimeoutMs = 15_000,
-        private readonly connectionRecoveryTimeoutMs = 15_000,
-        private readonly emptySessionTimeoutMs = 10 * 60 * 1000,
-        private readonly trackStartupTimeoutMs = 20_000,
-        private readonly trackStallTimeoutMs = 30_000,
-        private readonly trackWatchdogIntervalMs = 5_000,
-        private readonly externalDisconnectGraceTimeoutMs = 5_000,
-        private readonly rateLimitCooldownMs = 60_000,
-        private readonly autoplayResolver: AutoplayTrackResolver = trackResolver,
-        private readonly autoplaySelector: AutoplaySelector = new AutoplaySelector()
-    ) {}
+    public constructor(options: GuildAudioSessionManagerOptions = {}) {
+        this.resources = options.resources ?? audioResourceManager;
+        this.inactivityTimeoutMs = options.inactivityTimeoutMs ?? 5 * 60 * 1000;
+        this.connectionReadyTimeoutMs = options.connectionReadyTimeoutMs ?? 15_000;
+        this.emptySessionTimeoutMs = options.emptySessionTimeoutMs ?? 10 * 60 * 1000;
+        this.trackStartupTimeoutMs = options.trackStartupTimeoutMs ?? 20_000;
+        this.trackStallTimeoutMs = options.trackStallTimeoutMs ?? 30_000;
+        this.trackWatchdogIntervalMs = options.trackWatchdogIntervalMs ?? 5_000;
+        this.externalDisconnectGraceTimeoutMs = options.externalDisconnectGraceTimeoutMs ?? 5_000;
+        this.rateLimitCooldownMs = options.rateLimitCooldownMs ?? 60_000;
+        this.autoplayCoordinator = options.autoplayCoordinator ?? new AutoplayCoordinator({
+            resolver: options.autoplayResolver ?? trackResolver,
+            selector: options.autoplaySelector ?? new AutoplaySelector()
+        });
+        this.voiceRecoveryPolicy = options.voiceRecoveryPolicy ?? new VoiceRecoveryPolicy({
+            attemptTimeoutMs: options.connectionRecoveryTimeoutMs
+        });
+    }
 
     public async connect(
         guildId: string,
@@ -148,15 +152,7 @@ export class GuildAudioSessionManager {
             queue: new Deque<QueuedTrack>(),
             announcementChannel: null,
             transition: Promise.resolve(),
-            autoplayEnabled: false,
-            autoplayHistory: {
-                tracks: new TrackPlaybackHistory(
-                    AUTOPLAY_RECENT_TRACK_WINDOW_SIZE,
-                    AUTOPLAY_PLAY_COUNT_WINDOW_SIZE
-                )
-            },
-            autoplayCandidateCache: new Map(),
-            autoplayCandidateLookups: new Map(),
+            autoplay: this.autoplayCoordinator.createState(),
             hasBeenReady: connection.state.status === VoiceConnectionStatus.Ready,
             closing: false
         };
@@ -269,18 +265,16 @@ export class GuildAudioSessionManager {
 
     public isAutoplayEnabled(guildId: string): boolean {
         const session = this.sessions.get(guildId);
-        return Boolean(session && !session.closing && session.autoplayEnabled);
+        return Boolean(session && !session.closing && session.autoplay.enabled);
     }
 
     public setAutoplay(guildId: string, enabled: boolean): boolean {
         const session = this.sessions.get(guildId);
         if (!session || session.closing) return false;
-        if (session.autoplayEnabled === enabled) return true;
+        if (session.autoplay.enabled === enabled) return true;
 
-        session.autoplayEnabled = enabled;
         if (!enabled) {
-            session.autoplayController?.abort();
-            this.cancelAutoplayCandidateLookups(session);
+            this.autoplayCoordinator.disable(session.autoplay);
             if (!session.current) {
                 void this.schedule(session, () => this.startNext(session));
             }
@@ -288,7 +282,11 @@ export class GuildAudioSessionManager {
         }
 
         this.clearInactivityTimer(session);
-        this.prefetchAutoplaySeeds(session);
+        this.autoplayCoordinator.enable(
+            session.guildId,
+            session.autoplay,
+            () => !session.closing
+        );
         if (session.current?.metadata.kind === 'elevator') {
             const elevator = session.current;
             session.player.stop();
@@ -312,7 +310,7 @@ export class GuildAudioSessionManager {
             return { accepted: false, startsImmediately: false, position: MAX_QUEUE_SIZE };
         }
 
-        session.autoplayController?.abort();
+        this.autoplayCoordinator.cancelSelection(session.autoplay);
         const startsImmediately = queueWasEmpty && (!session.current || currentKind === 'elevator');
 
         this.clearInactivityTimer(session);
@@ -425,19 +423,17 @@ export class GuildAudioSessionManager {
                         this.externalDisconnectGraceTimeoutMs
                     );
                 } else {
-                    const estimateMinutes = getVoiceRecoveryEstimateMinutes(
-                        this.connectionRecoveryTimeoutMs
-                    );
+                    const estimateMinutes = this.voiceRecoveryPolicy.estimatedDurationMinutes;
                     console.info(
                         `Transient voice outage detected in guild ${session.guildId}; ` +
-                        `trying up to ${VOICE_RECOVERY_MAX_ATTEMPTS} recovery attempts over ` +
+                        `trying up to ${this.voiceRecoveryPolicy.maxAttempts} recovery attempts over ` +
                         `about ${estimateMinutes} minutes.`
                     );
                     this.notify(
                         session,
                         `⚠️ **Voice connection interrupted**\n` +
                         `Discord may be having an outage. Retrying up to ` +
-                        `${VOICE_RECOVERY_MAX_ATTEMPTS} times over about ` +
+                        `${this.voiceRecoveryPolicy.maxAttempts} times over about ` +
                         `${estimateMinutes} minutes.`
                     );
                     await this.retryTransientRecovery(session, recovery, controller.signal);
@@ -477,48 +473,34 @@ export class GuildAudioSessionManager {
         recovery: VoiceRecovery,
         signal: AbortSignal
     ): Promise<void> {
-        let lastError: unknown = new Error('Voice connection did not become ready.');
-
-        for (let attempt = 1; attempt <= VOICE_RECOVERY_MAX_ATTEMPTS; attempt++) {
-            if (!this.isRecoveryActive(session, recovery) || signal.aborted) return;
-
-            const backoffMs = getVoiceRecoveryBackoffMs(attempt);
-            if (backoffMs > 0) {
-                console.info(
-                    `Voice recovery attempt ${attempt}/${VOICE_RECOVERY_MAX_ATTEMPTS} ` +
-                    `for guild ${session.guildId} starts in ${backoffMs / 1_000}s.`
-                );
-                if (!await this.waitForRecoveryDelay(backoffMs, signal)) return;
-
+        await this.voiceRecoveryPolicy.recover(
+            signal,
+            async ({ attempt, maxAttempts, signal: attemptSignal }) => {
                 if (!this.isRecoveryActive(session, recovery)) return;
-            }
-
-            try {
                 if (attempt > 1 && !session.connection.rejoin()) {
                     throw new Error('Discord rejected the voice rejoin request.');
                 }
                 console.info(
-                    `Voice recovery attempt ${attempt}/${VOICE_RECOVERY_MAX_ATTEMPTS} ` +
-                    `for guild ${session.guildId}.`
+                    `Voice recovery attempt ${attempt}/${maxAttempts} for guild ${session.guildId}.`
                 );
-                await this.awaitRecoveryAttempt(
-                    session,
-                    signal,
-                    this.connectionRecoveryTimeoutMs
-                );
-                return;
-            } catch (error) {
-                if (!this.isRecoveryActive(session, recovery) || signal.aborted) return;
-                lastError = error;
-                console.warn(
-                    `Voice recovery attempt ${attempt}/${VOICE_RECOVERY_MAX_ATTEMPTS} ` +
-                    `failed in guild ${session.guildId}:`,
-                    error
-                );
+                await this.awaitReady(session, attemptSignal);
+            },
+            {
+                onBackoff: (attempt, delayMs) => {
+                    console.info(
+                        `Voice recovery attempt ${attempt}/${this.voiceRecoveryPolicy.maxAttempts} ` +
+                        `for guild ${session.guildId} starts in ${delayMs / 1_000}s.`
+                    );
+                },
+                onFailure: (attempt, error) => {
+                    console.warn(
+                        `Voice recovery attempt ${attempt}/${this.voiceRecoveryPolicy.maxAttempts} ` +
+                        `failed in guild ${session.guildId}:`,
+                        error
+                    );
+                }
             }
-        }
-
-        throw lastError;
+        );
     }
 
     private async awaitRecoveryAttempt(
@@ -539,22 +521,6 @@ export class GuildAudioSessionManager {
             clearTimeout(timeout);
             recoverySignal.removeEventListener('abort', abortAttempt);
         }
-    }
-
-    private waitForRecoveryDelay(delayMs: number, signal: AbortSignal): Promise<boolean> {
-        if (signal.aborted) return Promise.resolve(false);
-
-        return new Promise(resolve => {
-            const finish = (elapsed: boolean) => {
-                clearTimeout(timeout);
-                signal.removeEventListener('abort', handleAbort);
-                resolve(elapsed);
-            };
-            const handleAbort = () => finish(false);
-            const timeout = setTimeout(() => finish(true), delayMs);
-            timeout.unref();
-            signal.addEventListener('abort', handleAbort, { once: true });
-        });
     }
 
     private isRecoveryActive(session: GuildAudioSession, recovery: VoiceRecovery): boolean {
@@ -641,10 +607,7 @@ export class GuildAudioSessionManager {
         this.clearInactivityTimer(session);
         this.clearTrackWatchdog(session);
         this.cancelRecovery(session);
-        session.autoplayController?.abort();
-        session.autoplayController = undefined;
-        this.cancelAutoplayCandidateLookups(session);
-        session.autoplayCandidateCache.clear();
+        this.autoplayCoordinator.dispose(session.autoplay);
 
         session.player.removeAllListeners();
         session.player.stop(true);
@@ -665,7 +628,7 @@ export class GuildAudioSessionManager {
         while (!session.closing) {
             const queuedTrack = session.queue.popFront();
             if (!queuedTrack) {
-                if (session.autoplayEnabled && session.lastTrack) {
+                if (session.autoplay.enabled) {
                     if (await this.startAutoplay(session)) return;
                     if (session.queue.size() > 0) continue;
                 }
@@ -681,7 +644,12 @@ export class GuildAudioSessionManager {
                 const resource = this.takePreload(session, track) ?? this.resources.createTrackResource(track);
                 session.current = resource;
                 session.player.play(resource);
-                this.recordStartedTrack(session, track);
+                this.autoplayCoordinator.recordStartedTrack(
+                    session.guildId,
+                    session.autoplay,
+                    track,
+                    () => !session.closing
+                );
                 this.startTrackWatchdog(session, resource);
                 this.notify(session, {
                     embeds: [createNowPlayingEmbed(track, session.queue.size())]
@@ -700,51 +668,33 @@ export class GuildAudioSessionManager {
     }
 
     private async startAutoplay(session: GuildAudioSession): Promise<boolean> {
-        const lastTrack = session.lastTrack;
-        if (!session.autoplayEnabled || !lastTrack || session.closing || session.current) return false;
+        if (
+            !session.autoplay.enabled ||
+            !this.autoplayCoordinator.hasPlaybackHistory(session.autoplay) ||
+            session.closing ||
+            session.current
+        ) return false;
 
         this.clearInactivityTimer(session);
-        session.autoplayController?.abort();
-        const controller = new AbortController();
-        session.autoplayController = controller;
 
         let resource: BeanAudioResource | undefined;
         try {
-            const seeds = this.autoplaySelector.selectSeeds(session.autoplayHistory);
-            const resolutions = await Promise.all(seeds.map(seed => (
-                this.resolveAutoplaySeed(session, seed, controller.signal)
-            )));
-
-            if (
-                controller.signal.aborted ||
-                session.autoplayController !== controller ||
-                !session.autoplayEnabled ||
-                session.closing ||
-                session.current ||
-                session.queue.size() > 0
-            ) return false;
-
-            const batches = resolutions.flatMap(({ batch }) => batch ? [batch] : []);
-            const selection = this.autoplaySelector.selectCandidate(
-                batches,
-                session.autoplayHistory
+            const track = await this.autoplayCoordinator.selectNext(
+                session.guildId,
+                session.autoplay,
+                () => !session.closing && !session.current && session.queue.size() === 0
             );
-            if (!selection) {
-                const resolutionError = resolutions.find(({ error }) => error)?.error;
-                if (resolutionError) {
-                    console.error(
-                        `Failed to resolve autoplay candidates in guild ${session.guildId}:`,
-                        resolutionError
-                    );
-                }
-                return false;
-            }
+            if (!track) return false;
 
-            const track = selection.track;
             resource = this.resources.createTrackResource(track);
             session.current = resource;
             session.player.play(resource);
-            this.recordStartedTrack(session, track);
+            this.autoplayCoordinator.recordStartedTrack(
+                session.guildId,
+                session.autoplay,
+                track,
+                () => !session.closing
+            );
             this.startTrackWatchdog(session, resource);
             this.notify(session, {
                 embeds: [createNowPlayingEmbed(track, session.queue.size())]
@@ -752,156 +702,10 @@ export class GuildAudioSessionManager {
             return true;
         } catch (error) {
             if (resource && session.current === resource) this.releaseCurrent(session);
-            if (!controller.signal.aborted) {
+            if (!session.closing) {
                 console.error(`Failed to start autoplay in guild ${session.guildId}:`, error);
             }
             return false;
-        } finally {
-            if (session.autoplayController === controller) {
-                session.autoplayController = undefined;
-            }
-        }
-    }
-
-    private async resolveAutoplaySeed(
-        session: GuildAudioSession,
-        seed: AutoplaySeed,
-        signal: AbortSignal
-    ): Promise<AutoplaySeedResolution> {
-        try {
-            const candidates = await this.getOrStartAutoplayCandidateLookup(session, seed.track);
-            if (signal.aborted) return {};
-            return { batch: { seed, candidates } };
-        } catch (error) {
-            return signal.aborted ? {} : { error };
-        }
-    }
-
-    private getOrStartAutoplayCandidateLookup(
-        session: GuildAudioSession,
-        seed: TrackMetadata
-    ): Promise<readonly TrackMetadata[]> {
-        const seedKey = getMediaKey(seed);
-        const cached = this.getCachedAutoplayCandidates(session, seedKey);
-        if (cached) return Promise.resolve(cached);
-
-        const active = session.autoplayCandidateLookups.get(seedKey);
-        if (active) return active.promise;
-
-        const controller = new AbortController();
-        const lookup = {
-            controller,
-            promise: Promise.resolve<readonly TrackMetadata[]>([])
-        };
-        lookup.promise = this.autoplayResolver.resolveAutoplayCandidates(
-            seed,
-            AUTOPLAY_CANDIDATE_LIMIT,
-            controller.signal
-        ).then(candidates => {
-            if (!controller.signal.aborted && candidates.length > 0) {
-                this.cacheAutoplayCandidates(session, seedKey, candidates);
-            }
-            return controller.signal.aborted ? [] : candidates;
-        }).finally(() => {
-            if (session.autoplayCandidateLookups.get(seedKey) === lookup) {
-                session.autoplayCandidateLookups.delete(seedKey);
-            }
-        });
-        session.autoplayCandidateLookups.set(seedKey, lookup);
-        void lookup.promise.catch(() => undefined);
-        return lookup.promise;
-    }
-
-    private prefetchAutoplaySeeds(session: GuildAudioSession): void {
-        if (!session.autoplayEnabled || session.closing) return;
-
-        for (const seed of this.autoplaySelector.selectSeeds(session.autoplayHistory)) {
-            void this.getOrStartAutoplayCandidateLookup(session, seed.track).catch(error => {
-                if (session.autoplayEnabled && !session.closing) {
-                    console.error(
-                        `Failed to prefetch autoplay candidates for ${seed.track.title} ` +
-                        `in guild ${session.guildId}:`,
-                        error
-                    );
-                }
-            });
-        }
-    }
-
-    private cancelAutoplayCandidateLookups(session: GuildAudioSession): void {
-        for (const lookup of session.autoplayCandidateLookups.values()) {
-            lookup.controller.abort();
-        }
-        session.autoplayCandidateLookups.clear();
-    }
-
-    private pruneAutoplayCandidateLookups(session: GuildAudioSession): void {
-        const retainedKeys = new Set(
-            this.autoplaySelector.selectSeeds(session.autoplayHistory).map(seed => seed.mediaKey)
-        );
-        for (const [seedKey, lookup] of session.autoplayCandidateLookups) {
-            if (retainedKeys.has(seedKey)) continue;
-            lookup.controller.abort();
-            session.autoplayCandidateLookups.delete(seedKey);
-        }
-    }
-
-    private getCachedAutoplayCandidates(
-        session: GuildAudioSession,
-        seedKey: string
-    ): readonly TrackMetadata[] | undefined {
-        const cached = session.autoplayCandidateCache.get(seedKey);
-        if (!cached) return undefined;
-        if (cached.expiresAt <= Date.now()) {
-            session.autoplayCandidateCache.delete(seedKey);
-            return undefined;
-        }
-
-        session.autoplayCandidateCache.delete(seedKey);
-        session.autoplayCandidateCache.set(seedKey, cached);
-        return cached.candidates;
-    }
-
-    private cacheAutoplayCandidates(
-        session: GuildAudioSession,
-        seedKey: string,
-        candidates: readonly TrackMetadata[]
-    ): void {
-        session.autoplayCandidateCache.delete(seedKey);
-        session.autoplayCandidateCache.set(seedKey, {
-            candidates,
-            expiresAt: Date.now() + AUTOPLAY_CANDIDATE_CACHE_TTL_MS
-        });
-
-        while (session.autoplayCandidateCache.size > AUTOPLAY_CANDIDATE_CACHE_SIZE) {
-            const oldestKey = session.autoplayCandidateCache.keys().next().value as string;
-            session.autoplayCandidateCache.delete(oldestKey);
-        }
-    }
-
-    private recordStartedTrack(
-        session: GuildAudioSession,
-        track: TrackMetadata
-    ): void {
-        const mediaKey = getMediaKey(track);
-        session.autoplayHistory.tracks.record({
-            mediaKey,
-            track: { ...track },
-            source: track.autoplay ? 'autoplay' : 'manual'
-        });
-
-        session.lastTrack = track;
-        this.pruneAutoplayCandidateLookups(session);
-        if (session.autoplayEnabled) {
-            void this.getOrStartAutoplayCandidateLookup(session, track).catch(error => {
-                if (session.autoplayEnabled && !session.closing) {
-                    console.error(
-                        `Failed to prefetch autoplay candidates for ${track.title} ` +
-                        `in guild ${session.guildId}:`,
-                        error
-                    );
-                }
-            });
         }
     }
 

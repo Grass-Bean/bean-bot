@@ -9,18 +9,6 @@ import {
     ButtonInteraction,
     ComponentType,
 } from 'discord.js';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// Define interface for what a Command file looks like
-interface CommandModule {
-    data: SlashCommandBuilder;
-    hidden?: boolean;
-}
 
 interface CommandInfo {
     name: string;
@@ -36,25 +24,13 @@ export default {
         // Defer the reply first
         await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-        // Get all commands
-        const commands: CommandInfo[] = [];
-        const commandsPath = path.join(__dirname, '..'); 
-        const commandFiles = fs.readdirSync(commandsPath, { withFileTypes: true, recursive: true })
-                                // Skip the help command itself to avoid circular confusion or listing itself if desired
-                                .filter(file => file.name.endsWith('.js')&& file.name !== 'help.js')
-                                .map(file => path.join(file.parentPath, file.name));
-        for (const file of commandFiles) {
-            // Dynamic import for TS/ESM compatibility
-            const commandModule = await import(pathToFileURL(file).href);
-            const command: CommandModule = commandModule.default;
-
-            if (!command.data || command.hidden) continue;
-            
-            commands.push({
+        const commands: CommandInfo[] = [...interaction.client.commands.values()]
+            .filter(command => command.data.name !== 'help' && !command.hidden)
+            .map(command => ({
                 name: `/${command.data.name}`,
                 description: command.data.description || 'No description available'
-            });
-        }
+            }))
+            .sort((left, right) => left.name.localeCompare(right.name));
 
         // Pagination setup
         const itemsPerPage = 5;

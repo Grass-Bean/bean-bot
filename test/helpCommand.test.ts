@@ -1,15 +1,17 @@
 import { EventEmitter } from 'node:events';
-import fs from 'node:fs';
-import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MessageFlags } from 'discord.js';
+import { MessageFlags, SlashCommandBuilder } from 'discord.js';
 import helpCommand from '../src/commands/utility/help.js';
 
-const fixtureDirectory = path.resolve('test/fixtures');
-const dirent = (name: string) => ({ name, parentPath: fixtureDirectory });
+const command = (name: string, hidden = false) => ({
+    data: new SlashCommandBuilder().setName(name).setDescription(`${name} command`),
+    hidden,
+    execute: vi.fn()
+});
 
-const interaction = () => ({
+const interaction = (commands: unknown[] = []) => ({
     user: { id: 'owner' },
+    client: { commands: new Map(commands.map((value: any) => [value.data.name, value])) },
     deferReply: vi.fn().mockResolvedValue(undefined),
     editReply: vi.fn().mockResolvedValue({})
 }) as any;
@@ -20,7 +22,6 @@ describe('/help', () => {
     });
 
     it('renders the no-command state without a collector', async () => {
-        vi.spyOn(fs, 'readdirSync').mockReturnValue([] as any);
         const commandInteraction = interaction();
         await helpCommand.execute(commandInteraction);
 
@@ -31,14 +32,12 @@ describe('/help', () => {
     });
 
     it('loads visible commands, paginates, checks ownership, and clears controls', async () => {
-        vi.spyOn(fs, 'readdirSync').mockReturnValue([
-            ...Array.from({ length: 6 }, () => dirent('help-command.js')),
-            dirent('hidden-command.js'),
-            dirent('help.js'),
-            dirent('not-a-command.txt')
-        ] as any);
         const collector = new EventEmitter();
-        const commandInteraction = interaction();
+        const commandInteraction = interaction([
+            ...Array.from({ length: 6 }, (_, index) => command(`command-${index}`)),
+            command('hidden', true),
+            command('help')
+        ]);
         commandInteraction.editReply.mockResolvedValue({
             createMessageComponentCollector: vi.fn().mockReturnValue(collector)
         });
@@ -71,11 +70,10 @@ describe('/help', () => {
     });
 
     it('ignores an unknown-message cleanup failure and logs other failures', async () => {
-        vi.spyOn(fs, 'readdirSync').mockReturnValue(
-            Array.from({ length: 6 }, () => dirent('help-command.js')) as any
-        );
         const collector = new EventEmitter();
-        const commandInteraction = interaction();
+        const commandInteraction = interaction(
+            Array.from({ length: 6 }, (_, index) => command(`command-${index}`))
+        );
         commandInteraction.editReply.mockResolvedValueOnce({
             createMessageComponentCollector: vi.fn().mockReturnValue(collector)
         });

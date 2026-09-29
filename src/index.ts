@@ -15,6 +15,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Client, Collection, GatewayIntentBits } from 'discord.js';
 import 'dotenv/config';
+import { loadCommands } from './commandLoader.js';
 import { deployCommands } from './deploy-commands.js';
 const { DISCORD_TOKEN, GUILD_ONLY } = process.env;
 if (!DISCORD_TOKEN||!GUILD_ONLY) {
@@ -38,34 +39,21 @@ const client = new Client({
 client.commands = new Collection();
 
 const foldersPath = path.join(__dirname, 'commands');
-const commandFolders = fs.readdirSync(foldersPath);
-
 (async () => {
-    // Load commands to memory
-    for (const folder of commandFolders) {
-        const commandsPath = path.join(foldersPath, folder);
-        const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
-
-        for (const file of commandFiles) {
-            const filePath = path.join(commandsPath, file);
-            
-            const commandModule = await import(pathToFileURL(filePath).href); 
-            const command = commandModule.default;
-
-            if ('data' in command && 'execute' in command) {
-                client.commands.set(command.data.name, command);
-                if (command.cooldown) {
-                    rateLimiter.setLimit(command.data.name, command.cooldown);
-                    console.log(`-> Registered rate limit for ${command.data.name}: ${command.cooldown}ms`);
-                }
-            } else {
-                console.log(`[WARNING] The command at ${filePath} is missing a required "data" or "execute" property.`);
-            }
+    const loadedCommands = await loadCommands(foldersPath);
+    for (const { command } of loadedCommands) {
+        client.commands.set(command.data.name, command);
+        if (command.cooldown) {
+            rateLimiter.setLimit(command.data.name, command.cooldown);
+            console.log(`-> Registered rate limit for ${command.data.name}: ${command.cooldown}ms`);
         }
     }
 
     // Deploy commands to Discord
-    await deployCommands(GUILD_ONLY === 'true');
+    await deployCommands(
+        GUILD_ONLY === 'true',
+        loadedCommands.map(({ command }) => command)
+    );
 
     const eventsPath = path.join(__dirname, 'events');
     const eventFiles = fs.readdirSync(eventsPath).filter(file => file.endsWith('.js') || file.endsWith('.ts'));
