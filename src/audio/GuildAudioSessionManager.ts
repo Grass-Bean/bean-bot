@@ -126,14 +126,9 @@ export class GuildAudioSessionManager {
             if (existing.channelId !== channelId) {
                 throw new Error(`Audio is already active in voice channel ${existing.channelId}.`);
             }
-            try {
-                const readyConnection = await this.awaitReady(existing);
-                existing.hasBeenReady = true;
-                return readyConnection;
-            } catch (error) {
-                this.closeSession(existing, true);
-                throw error;
-            }
+            const readyConnection = await this.awaitReady(existing);
+            existing.hasBeenReady = true;
+            return readyConnection;
         }
 
         const connection = joinVoiceChannel({
@@ -197,6 +192,9 @@ export class GuildAudioSessionManager {
             if (newState.status === VoiceConnectionStatus.Ready) {
                 session.hasBeenReady = true;
                 this.cancelRecovery(session);
+                if (!session.current && session.queue.size() > 0) {
+                    void this.schedule(session, () => this.startNext(session));
+                }
                 return;
             }
             if (session.hasBeenReady) {
@@ -477,13 +475,30 @@ export class GuildAudioSessionManager {
             signal,
             async ({ attempt, maxAttempts, signal: attemptSignal }) => {
                 if (!this.isRecoveryActive(session, recovery)) return;
-                if (attempt > 1 && !session.connection.rejoin()) {
-                    throw new Error('Discord rejected the voice rejoin request.');
+                // A rejoin only sends a gateway payload. Recreate networking
+                // on every attempt to open a fresh voice WebSocket.
+                session.connection.configureNetworking();
+                const state = session.connection.state;
+                if (state.status !== VoiceConnectionStatus.Connecting) {
+                    throw new Error('No voice server endpoint is available for recovery.');
                 }
+                const networking = state.networking;
                 console.info(
                     `Voice recovery attempt ${attempt}/${maxAttempts} for guild ${session.guildId}.`
                 );
-                await this.awaitReady(session, attemptSignal);
+                try {
+                    await this.awaitReady(session, attemptSignal);
+                } catch (error) {
+                    const currentState = session.connection.state;
+                    if (
+                        this.isRecoveryActive(session, recovery) &&
+                        currentState.status === VoiceConnectionStatus.Connecting &&
+                        currentState.networking === networking
+                    ) {
+                        networking.destroy();
+                    }
+                    throw error;
+                }
             },
             {
                 onBackoff: (attempt, delayMs) => {
@@ -622,7 +637,11 @@ export class GuildAudioSessionManager {
     }
 
     private async startNext(session: GuildAudioSession): Promise<void> {
-        if (session.closing || session.current) return;
+        if (
+            session.closing ||
+            session.current ||
+            session.connection.state.status !== VoiceConnectionStatus.Ready
+        ) return;
         this.clearTrackWatchdog(session);
 
         while (!session.closing) {
@@ -808,13 +827,14 @@ export class GuildAudioSessionManager {
 
         this.clearTrackWatchdog(session);
 
-        const startedAt = Date.now();
+        let startedAt = Date.now();
         const maximumPlaybackMs = resource.metadata.duration === undefined
             ? undefined
             : Math.max(60_000, Math.ceil(resource.metadata.duration * 1_500) + 30_000);
         let playbackStartedAt: number | undefined;
         let lastPlaybackDuration = 0;
         let lastProgressAt = startedAt;
+        let unavailableSince: number | undefined;
 
         const watchdog = setInterval(() => {
             if (session.closing || session.current !== resource) {
@@ -823,6 +843,17 @@ export class GuildAudioSessionManager {
             }
 
             const now = Date.now();
+            if (session.connection.state.status !== VoiceConnectionStatus.Ready) {
+                unavailableSince ??= now;
+                return;
+            }
+            if (unavailableSince !== undefined) {
+                const unavailableMs = now - unavailableSince;
+                startedAt += unavailableMs;
+                if (playbackStartedAt !== undefined) playbackStartedAt += unavailableMs;
+                lastProgressAt += unavailableMs;
+                unavailableSince = undefined;
+            }
             if (session.player.state.status !== AudioPlayerStatus.Playing) {
                 if (!playbackStartedAt && now - startedAt >= this.trackStartupTimeoutMs) {
                     this.stopWatchedTrack(session, resource, 'Playback didn’t start in time');

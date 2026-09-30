@@ -29,6 +29,7 @@ import {
     VoiceConnectionRateLimitError
 } from '../src/audio/GuildAudioSessionManager.js';
 import { AutoplaySelector } from '../src/audio/AutoplaySelector.js';
+import { VoiceRecoveryPolicy } from '../src/audio/VoiceRecoveryPolicy.js';
 import type { AudioResourceManager } from '../src/audio/AudioResourceManager.js';
 import type {
     AutoplayTrackResolver,
@@ -42,6 +43,7 @@ type FakeConnection = EventEmitter & {
     subscribe: ReturnType<typeof vi.fn>;
     destroy: ReturnType<typeof vi.fn>;
     rejoin: ReturnType<typeof vi.fn>;
+    configureNetworking: ReturnType<typeof vi.fn>;
 };
 
 type FakePlayer = EventEmitter & {
@@ -62,6 +64,14 @@ const createConnection = (
     connection.joinConfig = { channelId };
     connection.subscribe = vi.fn();
     connection.rejoin = vi.fn().mockReturnValue(true);
+    connection.configureNetworking = vi.fn(() => {
+        const oldState = connection.state;
+        const networking = Object.assign(new EventEmitter(), { destroy: vi.fn() });
+        oldState.networking?.destroy?.();
+        connection.state = { status: VoiceConnectionStatus.Connecting, networking };
+        connection.emit('stateChange', oldState, connection.state);
+        return networking;
+    });
     connection.destroy = vi.fn(() => {
         connection.state = { status: VoiceConnectionStatus.Destroyed };
     });
@@ -196,7 +206,7 @@ describe('GuildAudioSessionManager', () => {
         expect(manager.getActiveChannelId('guild-a')).toBeUndefined();
     });
 
-    it('closes a reused connecting session when its readiness check fails', async () => {
+    it('leaves a reused connecting session intact when its readiness check fails', async () => {
         connection = createConnection(VoiceConnectionStatus.Connecting);
         joinMock.mockReturnValue(connection);
         entersStateMock.mockResolvedValueOnce(connection);
@@ -211,8 +221,8 @@ describe('GuildAudioSessionManager', () => {
         await expect(manager.connect('guild-a', 'voice-a', {} as any)).rejects.toThrow(
             'reconnect failed'
         );
-        expect(connection.destroy).toHaveBeenCalledOnce();
-        expect(manager.getActiveChannelId('guild-a')).toBeUndefined();
+        expect(connection.destroy).not.toHaveBeenCalled();
+        expect(manager.getActiveChannelId('guild-a')).toBe('voice-a');
     });
 
     it('synchronizes a moved voice channel from the connection join config', async () => {
@@ -630,6 +640,7 @@ describe('GuildAudioSessionManager', () => {
         connection.state = disconnected;
         connection.emit('stateChange', {}, disconnected);
         await flushTransitions();
+        const recoveringNetworking = connection.state.networking;
 
         const ready = {
             status: VoiceConnectionStatus.Ready,
@@ -640,6 +651,7 @@ describe('GuildAudioSessionManager', () => {
         await flushTransitions();
 
         expect(recoverySignal?.aborted).toBe(true);
+        expect(recoveringNetworking.destroy).not.toHaveBeenCalled();
         expect(manager.getActiveChannelId('guild-a')).toBe('voice-a');
         expect(connection.destroy).not.toHaveBeenCalled();
     });
@@ -665,7 +677,8 @@ describe('GuildAudioSessionManager', () => {
         await vi.advanceTimersByTimeAsync(30_000);
         await vi.waitFor(() => expect(manager.getActiveChannelId('guild-a')).toBeUndefined());
         expect(entersStateMock).toHaveBeenCalledTimes(5);
-        expect(connection.rejoin).toHaveBeenCalledTimes(4);
+        expect(connection.configureNetworking).toHaveBeenCalledTimes(5);
+        expect(connection.rejoin).not.toHaveBeenCalled();
         expect(errorSpy).toHaveBeenCalledWith(
             expect.stringContaining('Voice connection recovery failed'),
             expect.any(Error)
@@ -698,9 +711,121 @@ describe('GuildAudioSessionManager', () => {
         await vi.advanceTimersByTimeAsync(6_000);
         await flushTransitions();
 
-        expect(connection.rejoin).toHaveBeenCalledTimes(2);
+        expect(connection.configureNetworking).toHaveBeenCalledTimes(3);
+        expect(connection.rejoin).not.toHaveBeenCalled();
         expect(manager.getActiveChannelId('guild-a')).toBe('voice-a');
         expect(connection.destroy).not.toHaveBeenCalled();
+    });
+
+    it('replaces an already opening socket on the first recovery attempt', async () => {
+        vi.spyOn(console, 'info').mockImplementation(() => undefined);
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        const oldNetworking = Object.assign(new EventEmitter(), { destroy: vi.fn() });
+        const connecting = { status: VoiceConnectionStatus.Connecting, networking: oldNetworking };
+        connection.state = connecting;
+        connection.emit('stateChange', {}, connecting);
+        await flushTransitions();
+
+        expect(connection.configureNetworking).toHaveBeenCalledOnce();
+        expect(oldNetworking.destroy).toHaveBeenCalledOnce();
+        expect(connection.state.networking).not.toBe(oldNetworking);
+    });
+
+    it('opens a new voice WebSocket for each failed recovery attempt', async () => {
+        vi.useFakeTimers();
+        vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        vi.spyOn(console, 'info').mockImplementation(() => undefined);
+        vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        manager = createManager({
+            voiceRecoveryPolicy: new VoiceRecoveryPolicy({
+                maxAttempts: 2,
+                initialBackoffMs: 10,
+                attemptTimeoutMs: 20
+            })
+        });
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        entersStateMock
+            .mockRejectedValueOnce(new Error('Unexpected server response: 521'))
+            .mockImplementation((_target, _status, signal: AbortSignal) => (
+                new Promise((_resolve, reject) => {
+                    signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+                })
+            ));
+
+        const oldState = connection.state;
+        connection.state = { status: VoiceConnectionStatus.Signalling };
+        connection.emit('stateChange', oldState, connection.state);
+        await flushTransitions();
+        const firstNetworking = connection.configureNetworking.mock.results[0]!.value;
+
+        expect(firstNetworking.destroy).toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(10);
+        const secondNetworking = connection.state.networking;
+        expect(secondNetworking).not.toBe(firstNetworking);
+        expect(connection.configureNetworking).toHaveBeenCalledTimes(2);
+
+        await vi.advanceTimersByTimeAsync(20);
+        expect(secondNetworking.destroy).toHaveBeenCalled();
+        expect(connection.rejoin).not.toHaveBeenCalled();
+        expect(manager.getActiveChannelId('guild-a')).toBeUndefined();
+    });
+
+    it('keeps recovering when a concurrent connect times out', async () => {
+        vi.spyOn(console, 'info').mockImplementation(() => undefined);
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        entersStateMock.mockImplementationOnce((_target, _status, signal: AbortSignal) => (
+            new Promise((_resolve, reject) => {
+                signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+            })
+        ));
+        const disconnected = {
+            status: VoiceConnectionStatus.Disconnected,
+            reason: VoiceConnectionDisconnectReason.WebSocketClose,
+            closeCode: 4015
+        };
+        connection.state = disconnected;
+        connection.emit('stateChange', {}, disconnected);
+        await flushTransitions();
+
+        entersStateMock.mockRejectedValueOnce(new Error('command readiness timed out'));
+        await expect(manager.connect('guild-a', 'voice-a', {} as any)).rejects.toThrow(
+            'command readiness timed out'
+        );
+        expect(connection.destroy).not.toHaveBeenCalled();
+        expect(manager.getActiveChannelId('guild-a')).toBe('voice-a');
+
+        const ready = { status: VoiceConnectionStatus.Ready };
+        connection.state = ready;
+        connection.emit('stateChange', disconnected, ready);
+        await flushTransitions();
+        expect(connection.destroy).not.toHaveBeenCalled();
+    });
+
+    it('waits for voice readiness before starting the next queued track', async () => {
+        vi.spyOn(console, 'info').mockImplementation(() => undefined);
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        manager.enqueue('guild-a', makeTrack('one'), null);
+        manager.enqueue('guild-a', makeTrack('two'), null);
+        await flushTransitions();
+
+        const disconnected = {
+            status: VoiceConnectionStatus.Disconnected,
+            reason: VoiceConnectionDisconnectReason.WebSocketClose,
+            closeCode: 4015
+        };
+        connection.state = disconnected;
+        connection.emit('stateChange', {}, disconnected);
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+
+        expect(manager.getSnapshot('guild-a').current).toBeUndefined();
+        expect(manager.getSnapshot('guild-a').pending.map(track => track.id)).toEqual(['two']);
+
+        const ready = { status: VoiceConnectionStatus.Ready };
+        connection.state = ready;
+        connection.emit('stateChange', disconnected, ready);
+        await flushTransitions();
+        expect(manager.getSnapshot('guild-a').current?.id).toBe('two');
     });
 
     it('closes after failed external-disconnect recovery', async () => {
@@ -910,6 +1035,49 @@ describe('GuildAudioSessionManager', () => {
         expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
             content: expect.stringContaining('Playback stalled')
         }));
+    });
+
+    it('does not treat a voice outage as a stalled track', async () => {
+        vi.useFakeTimers();
+        vi.spyOn(console, 'info').mockImplementation(() => undefined);
+        manager = createManager({
+            trackStartupTimeoutMs: 10,
+            trackStallTimeoutMs: 10,
+            trackWatchdogIntervalMs: 5
+        });
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        manager.enqueue('guild-a', makeTrack('one'), null);
+        await flushTransitions();
+        const resource = resources.createTrackResource.mock.results[0]!.value;
+        resource.playbackDuration = 1;
+        await vi.advanceTimersByTimeAsync(5);
+
+        const disconnected = {
+            status: VoiceConnectionStatus.Disconnected,
+            reason: VoiceConnectionDisconnectReason.WebSocketClose,
+            closeCode: 4015
+        };
+        connection.state = disconnected;
+        connection.emit('stateChange', {}, disconnected);
+        player.state = { status: AudioPlayerStatus.AutoPaused };
+        await vi.advanceTimersByTimeAsync(40);
+
+        expect(player.stop).not.toHaveBeenCalled();
+        expect(manager.getSnapshot('guild-a').current?.id).toBe('one');
+
+        const ready = { status: VoiceConnectionStatus.Ready };
+        connection.state = ready;
+        connection.emit('stateChange', disconnected, ready);
+        player.state = { status: AudioPlayerStatus.Playing };
+        await vi.advanceTimersByTimeAsync(5);
+
+        expect(player.stop).not.toHaveBeenCalled();
+
+        resource.playbackDuration = 2;
+        await vi.advanceTimersByTimeAsync(5);
+
+        expect(player.stop).not.toHaveBeenCalled();
+        expect(manager.getSnapshot('guild-a').current?.id).toBe('one');
     });
 
     it('watchdog stops a progressing track after its duration safety limit', async () => {
