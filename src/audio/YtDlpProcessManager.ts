@@ -332,6 +332,7 @@ export class YtDlpProcessManager implements YtDlpProcessClient {
                 ? `yt-dlp closed after signal ${signal ?? 'unknown'}`
                 : `yt-dlp closed with code ${exitCode}`;
             const error = createFailure(outcome, 'PROCESS_FAILURE');
+            Object.assign(error, { exitCode, signal });
             settle({ status: 'failed', exitCode, signal, error });
         });
 

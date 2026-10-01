@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import 'dotenv/config';
 import { loadCommands } from './commandLoader.js';
 import type { BotCommand } from './commandTypes.js';
+import { logger } from './utility/logger.js';
 
 export async function deployCommands(
     guildOnly: boolean,
@@ -23,15 +24,17 @@ export async function deployCommands(
 
     const rest = new REST().setToken(DISCORD_TOKEN);
     
+    const started = performance.now();
+    const context = { component: 'deployment', count: commands.length, deploymentScope: guildOnly ? 'guild' : 'global' };
     try {
-        console.log(`Started refreshing ${commands.length} application (/) commands.`);
+        logger.info('commands.deploy_started', 'Refreshing application commands.', context);
         await rest.put(
             guildOnly ? Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID) : Routes.applicationCommands(CLIENT_ID),
             { body: commands },
         );  
 
-        console.log(`Successfully reloaded ${commands.length} application (/) commands.`);
+        logger.info('commands.deploy_completed', 'Application commands refreshed.', { ...context, elapsedMs: Math.round(performance.now() - started) });
     } catch (error) {
-        console.error(error);
+        logger.error('commands.deploy_failed', 'Application command deployment failed; startup will continue.', { ...context, error, elapsedMs: Math.round(performance.now() - started) });
     }
 }

@@ -1,3 +1,4 @@
+import { observeDiscordTask } from '../../utility/discordTask.js';
 import { 
     ChatInputCommandInteraction, 
     EmbedBuilder, 
@@ -126,7 +127,7 @@ export default {
                 time: 60000 // 1 minute timeout
             });
 
-            collector.on('collect', async (i: ButtonInteraction) => {
+            collector.on('collect', (i: ButtonInteraction) => observeDiscordTask(interaction, 'pagination.update_failed', async () => {
                 // Ensure only the original requester can change pages (optional, but good practice)
                 /* if (i.user.id !== interaction.user.id) {
                     await i.reply({ content: "You didn't run this command.", ephemeral: true });
@@ -144,11 +145,11 @@ export default {
                     embeds: [generateEmbed(currentPage)],
                     components: [generateButtons(currentPage)]
                 });
-            });
+            }));
 
             collector.on('end', () => {
                 // Remove buttons when timeout is reached
-                interaction.editReply({ components: [] }).catch(() => {});
+                void observeDiscordTask(interaction, 'pagination.cleanup_failed', () => interaction.editReply({ components: [] }), true);
             });
         }
     }

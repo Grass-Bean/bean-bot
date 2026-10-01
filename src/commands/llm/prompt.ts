@@ -1,3 +1,5 @@
+import { logger, registerSensitiveText, setCommandOutcome } from '../../utility/logger.js';
+import { sendCommandErrorResponse } from '../../utility/discordTask.js';
     import OpenAI from 'openai';
     import { SlashCommandBuilder, ChatInputCommandInteraction } from 'discord.js';
     const { NVIDIA_API_KEY } = process.env;
@@ -64,6 +66,7 @@ A: "Sun make light. Light many color mixed. Sky air scatter blue color more than
                     .setRequired(true)),
         async execute(interaction: ChatInputCommandInteraction) {
             const question = interaction.options.getString('question', true);
+            registerSensitiveText(question);
             await interaction.deferReply();
             
             try {
@@ -85,6 +88,7 @@ A: "Sun make light. Light many color mixed. Sky air scatter blue color more than
                         if (now - lastUpdateTimestamp > EDIT_INTERVAL) {
                             lastUpdateTimestamp = now;
                             const activeContent = fullText.slice(0, 2000) || "Thinking...";
+                            registerSensitiveText(activeContent);
                             
                             if (!isInitialEditDone) {
                                 await interaction.editReply(activeContent);
@@ -98,6 +102,8 @@ A: "Sun make light. Light many color mixed. Sky air scatter blue color more than
 
                 // Handle empty responses
                 if (!fullText) {
+                    setCommandOutcome('failed', 'empty_model_response');
+                    logger.warn('llm.empty_response', 'Model returned an empty response.', { component: 'llm' });
                     await interaction.editReply("Received an empty response from the model.");
                     return;
                 }
@@ -109,6 +115,7 @@ A: "Sun make light. Light many color mixed. Sky air scatter blue color more than
                 }
 
                 // Set final content on original reply
+                for (const chunk of finalChunks) registerSensitiveText(chunk);
                 await interaction.editReply(finalChunks[0]);
 
                 // Send remaining chunks as sequential follow-up messages
@@ -117,8 +124,9 @@ A: "Sun make light. Light many color mixed. Sky air scatter blue color more than
                 }
                 
             } catch (error) {
-                console.error("Error calling NVIDIA NIM stream:", error);
-                await interaction.editReply("Sorry, bot decided to kill itself halfway.");
+                setCommandOutcome('failed', 'llm_stream_error');
+                logger.error('llm.stream_failed', 'Model stream failed.', { component: 'llm', error });
+                await sendCommandErrorResponse(() => interaction.editReply("Sorry, bot decided to kill itself halfway."));
             }
         }
     }

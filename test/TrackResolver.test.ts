@@ -209,7 +209,7 @@ describe('TrackResolver', () => {
         );
     });
 
-    it('maps process exits and redacts diagnostic URL query strings', async () => {
+    it('carries process diagnostics to the consuming boundary without logging twice', async () => {
         const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
         vi.mocked(processes.collect).mockRejectedValue(new YtDlpProcessError(
             'yt-dlp exited with code 2',
@@ -221,10 +221,7 @@ describe('TrackResolver', () => {
             new TrackResolver({ logDiagnostics: true }, processes).resolve('song', 'user'),
             'PROCESS_FAILURE'
         );
-        expect(errorSpy).toHaveBeenCalledWith(
-            '[yt-dlp Diagnostic]',
-            'failed https://youtube.com/watch?[redacted]'
-        );
+        expect(errorSpy).not.toHaveBeenCalled();
     });
 
     it('wraps manager startup failures', async () => {
@@ -238,8 +235,8 @@ describe('TrackResolver', () => {
         ));
 
         await expect(new TrackResolver({}, processes).resolve('song', 'user'))
-            .rejects.toMatchObject({ code: 'PROCESS_FAILURE', cause });
-        expect(errorSpy).toHaveBeenCalled();
+            .rejects.toMatchObject({ code: 'PROCESS_FAILURE', cause: { code: 'SPAWN_FAILURE', cause } });
+        expect(errorSpy).not.toHaveBeenCalled();
     });
 
     it('cancels before collection or passes the signal through', async () => {

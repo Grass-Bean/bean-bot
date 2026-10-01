@@ -9,6 +9,9 @@ import {
 import { getMediaKey, type MediaKey } from './mediaIdentity.js';
 import { TrackPlaybackHistory, TrackPlaybackScope } from './TrackPlaybackHistory.js';
 import { trackResolver } from './TrackResolver.js';
+import { logger } from '../utility/logger.js';
+
+const log = logger.child({ component: 'autoplay' }, { inheritContext: false });
 import type {
     AutoplayCandidateBatch,
     AutoplaySeed,
@@ -93,7 +96,7 @@ export class AutoplayCoordinator {
         });
 
         this.pruneCandidateLookups(state);
-        if (state.enabled) this.prefetchTrack(guildId, state, track, isActive);
+        if (state.enabled) this.prefetchTrack(guildId, state, track);
     }
 
     public async selectNext(
@@ -112,7 +115,7 @@ export class AutoplayCoordinator {
 
         try {
             const resolutions = await Promise.all(seeds.map(seed => (
-                this.resolveSeed(state, seed, controller.signal)
+                this.resolveSeed(guildId, state, seed, controller.signal)
             )));
 
             if (
@@ -124,14 +127,14 @@ export class AutoplayCoordinator {
 
             const batches = resolutions.flatMap(({ batch }) => batch ? [batch] : []);
             const selection = this.selector.selectCandidate(batches, state.history);
-            if (selection) return selection.track;
+            if (selection) {
+                log.debug('autoplay.selected', 'Autoplay candidate selected.', { guildId, trackId: selection.track.id, seedCount: seeds.length });
+                return selection.track;
+            }
 
             const resolutionError = resolutions.find(({ error }) => error)?.error;
             if (resolutionError) {
-                console.error(
-                    `Failed to resolve autoplay candidates in guild ${guildId}:`,
-                    resolutionError
-                );
+                log.warn('autoplay.no_candidates', 'No usable autoplay candidates after lookup failures.', { guildId });
             }
             return undefined;
         } finally {
@@ -140,12 +143,13 @@ export class AutoplayCoordinator {
     }
 
     private async resolveSeed(
+        guildId: string,
         state: AutoplaySessionState,
         seed: AutoplaySeed,
         signal: AbortSignal
     ): Promise<AutoplaySeedResolution> {
         try {
-            const candidates = await this.getOrStartCandidateLookup(state, seed.track);
+            const candidates = await this.getOrStartCandidateLookup(guildId, state, seed.track);
             if (signal.aborted) return {};
             return { batch: { seed, candidates } };
         } catch (error) {
@@ -154,12 +158,16 @@ export class AutoplayCoordinator {
     }
 
     private getOrStartCandidateLookup(
+        guildId: string,
         state: AutoplaySessionState,
         seed: TrackMetadata
     ): Promise<readonly TrackMetadata[]> {
         const seedKey = getMediaKey(seed);
         const cached = this.getCachedCandidates(state, seedKey);
-        if (cached) return Promise.resolve(cached);
+        if (cached) {
+            log.debug('autoplay.cache_hit', 'Using cached autoplay candidates.', { guildId, seedTrackId: seed.id });
+            return Promise.resolve(cached);
+        }
 
         const active = state.candidateLookups.get(seedKey);
         if (active) return active.promise;
@@ -178,6 +186,13 @@ export class AutoplayCoordinator {
                 this.cacheCandidates(state, seedKey, candidates);
             }
             return controller.signal.aborted ? [] : candidates;
+        }).catch(error => {
+            if (!controller.signal.aborted) {
+                log.error('autoplay.lookup_failed', 'Autoplay candidate lookup failed.', { guildId, seedTrackId: seed.id, title: seed.title, error });
+            } else {
+                log.debug('autoplay.lookup_cancelled', 'Autoplay candidate lookup cancelled.', { guildId, seedTrackId: seed.id });
+            }
+            throw error;
         }).finally(() => {
             if (state.candidateLookups.get(seedKey) === lookup) {
                 state.candidateLookups.delete(seedKey);
@@ -196,25 +211,17 @@ export class AutoplayCoordinator {
         if (!state.enabled || !isActive()) return;
 
         for (const seed of this.selector.selectSeeds(state.history)) {
-            this.prefetchTrack(guildId, state, seed.track, isActive);
+            this.prefetchTrack(guildId, state, seed.track);
         }
     }
 
     private prefetchTrack(
         guildId: string,
         state: AutoplaySessionState,
-        track: TrackMetadata,
-        isActive: () => boolean
+        track: TrackMetadata
     ): void {
-        void this.getOrStartCandidateLookup(state, track).catch(error => {
-            if (state.enabled && isActive()) {
-                console.error(
-                    `Failed to prefetch autoplay candidates for ${track.title} ` +
-                    `in guild ${guildId}:`,
-                    error
-                );
-            }
-        });
+        // The shared lookup owns its error report, whether prefetch or selection consumes it.
+        void this.getOrStartCandidateLookup(guildId, state, track).catch(() => undefined);
     }
 
     private cancelCandidateLookups(state: AutoplaySessionState): void {

@@ -42,6 +42,7 @@ import queueCommand from '../src/commands/audio/queue.js';
 import autoplayCommand from '../src/commands/audio/autoplay.js';
 import { TrackResolverError } from '../src/audio/TrackResolver.js';
 import type { TrackMetadata } from '../src/audio/types.js';
+import { runWithLogContext, getLogContextFields } from '../src/utility/logger.js';
 
 const track = (id = 'track-a', title = 'Song *A*'): TrackMetadata => ({
     kind: 'track',
@@ -191,7 +192,10 @@ describe('audio commands', () => {
 
         it('resolves, connects, enqueues, escapes the title, and reports immediate play', async () => {
             const interaction = createInteraction();
-            await playCommand.execute(interaction);
+            await runWithLogContext({ interactionId: 'interaction-a' }, async () => {
+                await playCommand.execute(interaction);
+                expect(getLogContextFields()).toEqual({ interactionId: 'interaction-a', trackId: 'track-a' });
+            });
             expect(resolverMock.resolve).toHaveBeenCalledWith('song query', 'user-a');
             expect(controllerMock.connect).toHaveBeenCalledWith(interaction, 'voice-a');
             expect(sessionsMock.enqueue).toHaveBeenCalledWith('guild-a', track(), interaction.channel);

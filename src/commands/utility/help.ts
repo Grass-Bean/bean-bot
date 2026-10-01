@@ -1,3 +1,4 @@
+import { observeDiscordTask } from '../../utility/discordTask.js';
 import { 
     SlashCommandBuilder, 
     EmbedBuilder, 
@@ -85,7 +86,7 @@ export default {
                 time: 60000
             });
 
-            collector.on('collect', async (i: ButtonInteraction) => {
+            collector.on('collect', (i: ButtonInteraction) => observeDiscordTask(interaction, 'pagination.update_failed', async () => {
                 if (i.user.id !== interaction.user.id) {
                     await i.reply({ content: 'These buttons are not for you!', flags: MessageFlags.Ephemeral });
                     return;
@@ -97,17 +98,10 @@ export default {
                     embeds: [createEmbed(currentPage)],
                     components: [getButtons(currentPage)]
                 });
-            });
+            }));
 
             collector.on('end', () => {
-                interaction.editReply({
-                    components: []
-                }).catch((error) => {
-                    // Ignore "Unknown Message" errors (if ephemeral message was dismissed)
-                    if (error.code !== 10008) {
-                        console.error('Failed to remove buttons:', error);
-                    }
-                });
+                void observeDiscordTask(interaction, 'pagination.cleanup_failed', () => interaction.editReply({ components: [] }), true);
             });
         }
     }

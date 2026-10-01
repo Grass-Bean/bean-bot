@@ -11,6 +11,7 @@ import {
 import 'dotenv/config';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
+import { logger, setCommandOutcome } from '../../utility/logger.js';
 
 const { LEWD_COMMAND_PLACEHOLDER } = process.env;
 const FLARESOLVERR_URL = 'http://flaresolverr:8191/v1';
@@ -39,7 +40,8 @@ async function getRandomDoujin(): Promise<DoujinData | null> {
 
         // 1. Validate Response
         if (!response.data.solution || response.data.status === 'error') {
-            console.error('FlareSolverr Error:', response.data.message);
+            setCommandOutcome('failed', 'scraper_invalid_response');
+            logger.error('scraper.invalid_response', 'FlareSolverr returned an invalid response.', { component: 'scraper' });
             return null;
         }
 
@@ -84,7 +86,8 @@ async function getRandomDoujin(): Promise<DoujinData | null> {
         };
 
     } catch (error) {
-        console.error("Error fetching doujin:", error);
+        setCommandOutcome('failed', 'scraper_request_failed');
+        logger.error('scraper.request_failed', 'Failed to fetch content.', { component: 'scraper', error });
         return null;
     }
 }
@@ -99,6 +102,7 @@ export default {
     async execute(interaction: ChatInputCommandInteraction) {
         // 2. Runtime Safety Check (Critical for Discord TOS)
         if (interaction.channel instanceof TextChannel && !interaction.channel.nsfw) {
+            setCommandOutcome('rejected', 'nsfw_channel_required');
             await interaction.reply({ 
                 content: '❌ This command can only be used in NSFW channels!', 
                 flags: MessageFlags.Ephemeral

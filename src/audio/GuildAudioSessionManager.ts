@@ -11,7 +11,8 @@ import {
 } from '@discordjs/voice';
 import { escapeMarkdown, TextChannel, type MessageCreateOptions } from 'discord.js';
 import { Deque, MAX_QUEUE_SIZE } from './Deque.js';
-import { audioResourceManager, AudioResourceManager } from './AudioResourceManager.js';
+import { audioResourceManager, AudioResourceManager, getResourceFailure, reportResourceFailure } from './AudioResourceManager.js';
+import { logger, getLogContextFields, type LogFields } from '../utility/logger.js';
 import { AutoplayCoordinator } from './AutoplayCoordinator.js';
 import { createNowPlayingEmbed } from './audioPresentation.js';
 import { trackResolver } from './TrackResolver.js';
@@ -50,6 +51,7 @@ const VOICE_CLOSE_CODE_DESCRIPTIONS: Readonly<Record<number, string>> = {
 };
 
 const TERMINAL_VOICE_CLOSE_CODES = new Set([4021, 4022]);
+const log = logger.child({ component: 'audio' }, { inheritContext: false });
 
 export interface GuildAudioSessionManagerOptions {
     resources?: AudioResourceManager;
@@ -77,6 +79,9 @@ export class VoiceConnectionRateLimitError extends Error {
 
 export class GuildAudioSessionManager {
     private readonly sessions = new Map<string, GuildAudioSession>();
+    private readonly startedResources = new WeakSet<BeanAudioResource>();
+    private readonly endedResources = new WeakSet<BeanAudioResource>();
+    private readonly endReasons = new WeakMap<BeanAudioResource, string>();
     private readonly observedNetworkingInstances = new WeakSet<object>();
     private readonly rateLimitCooldowns = new Map<string, number>();
     private readonly resources: AudioResourceManager;
@@ -139,6 +144,8 @@ export class GuildAudioSessionManager {
             selfMute: false
         });
         const player = createAudioPlayer();
+        let readyReported = false;
+        log.info('voice.connecting', 'Joining voice channel.', { guildId, voiceChannelId: channelId });
         const session: GuildAudioSession = {
             guildId,
             channelId,
@@ -166,7 +173,9 @@ export class GuildAudioSessionManager {
 
         player.on('error', (error) => {
             const metadata = error.resource.metadata as AudioMetadata | null;
-            console.error(`Audio player error in guild ${guildId} (${metadata?.title ?? 'unknown resource'}):`, error);
+            const resource = error.resource as BeanAudioResource;
+            this.endReasons.set(resource, 'failed');
+            reportResourceFailure(resource, error, this.sessionFields(session), 'audio.player_failed');
             if (metadata?.kind === 'track') {
                 this.notify(
                     session,
@@ -176,20 +185,28 @@ export class GuildAudioSessionManager {
         });
 
         connection.on('error', (error) => {
-            console.error(`Voice connection error in guild ${guildId}:`, error);
+            log.error('voice.connection_error', 'Voice connection error.', { ...this.sessionFields(session), error });
         });
-        connection.on('stateChange', (_oldState, newState) => {
+        player.on('stateChange', (_oldState, newState) => {
+            log.debug('audio.player_state', 'Audio player state changed.', { ...this.sessionFields(session), state: newState.status });
+            if (newState.status === AudioPlayerStatus.Playing) this.logPlaybackStarted(session, newState.resource as BeanAudioResource);
+        });
+        connection.on('stateChange', (oldState, newState) => {
             this.syncSessionChannel(session);
+            log.debug('voice.state_changed', 'Voice state changed.', { ...this.sessionFields(session), oldState: oldState.status, state: newState.status });
 
             if (newState.status === VoiceConnectionStatus.Connecting) {
                 this.observeNetworkingClose(session, newState.networking);
             }
 
             if (newState.status === VoiceConnectionStatus.Destroyed) {
-                this.closeSession(session, false);
+                this.closeSession(session, false, 'connection_destroyed');
                 return;
             }
             if (newState.status === VoiceConnectionStatus.Ready) {
+                readyReported = true;
+                log.info('voice.ready', 'Voice connection ready.', this.sessionFields(session));
+                if (session.recovery) log.info('voice.recovery_succeeded', 'Voice connection recovered.', { ...this.sessionFields(session), recoveryKind: session.recovery.kind });
                 session.hasBeenReady = true;
                 this.cancelRecovery(session);
                 if (!session.current && session.queue.size() > 0) {
@@ -205,10 +222,7 @@ export class GuildAudioSessionManager {
                         ? newState.closeCode
                         : undefined;
                     const reason = VoiceConnectionDisconnectReason[newState.reason];
-                    console.info(
-                        `Voice connection disconnected in guild ${guildId} ` +
-                        `(reason=${reason}${closeCode === undefined ? '' : `, closeCode=${closeCode}`}).`
-                    );
+                    log.warn('voice.disconnected', 'Voice connection disconnected.', { ...this.sessionFields(session), reason, closeCode });
 
                     if (
                         newState.reason === VoiceConnectionDisconnectReason.Manual ||
@@ -239,11 +253,12 @@ export class GuildAudioSessionManager {
 
         try {
             const readyConnection = await this.awaitReady(session);
+            if (!readyReported) log.info('voice.ready', 'Voice connection ready.', this.sessionFields(session));
             session.hasBeenReady = true;
             this.scheduleInactivityDisconnect(session, this.emptySessionTimeoutMs);
             return readyConnection;
         } catch (error) {
-            this.closeSession(session, true);
+            this.closeSession(session, true, 'connect_failed');
             throw error;
         }
     }
@@ -270,6 +285,7 @@ export class GuildAudioSessionManager {
         const session = this.sessions.get(guildId);
         if (!session || session.closing) return false;
         if (session.autoplay.enabled === enabled) return true;
+        log.info('audio.autoplay_changed', 'Autoplay setting changed.', { ...this.sessionFields(session), enabled });
 
         if (!enabled) {
             this.autoplayCoordinator.disable(session.autoplay);
@@ -305,6 +321,7 @@ export class GuildAudioSessionManager {
         const queueWasEmpty = session.queue.size() === 0;
         const currentKind = session.current?.metadata.kind;
         if (!session.queue.pushBack({ track, announcementChannel: channel })) {
+            log.info('audio.queue_rejected', 'Queue is full.', { ...this.sessionFields(session), trackId: track.id });
             return { accepted: false, startsImmediately: false, position: MAX_QUEUE_SIZE };
         }
 
@@ -313,6 +330,7 @@ export class GuildAudioSessionManager {
 
         this.clearInactivityTimer(session);
         const position = startsImmediately ? 0 : session.queue.size();
+        log.info('audio.track_queued', 'Track added to queue.', { ...getLogContextFields(), ...this.sessionFields(session), trackId: track.id, title: track.title, requestedBy: track.requestedBy, position, startsImmediately });
 
         if (currentKind === 'elevator') {
             const stopped = session.player.stop();
@@ -339,13 +357,16 @@ export class GuildAudioSessionManager {
     public skip(guildId: string): boolean {
         const session = this.sessions.get(guildId);
         if (!session || session.closing || session.current?.metadata.kind !== 'track') return false;
-        return session.player.stop();
+        this.endReasons.set(session.current, 'skipped');
+        const stopped = session.player.stop();
+        if (!stopped && session.current) this.endReasons.delete(session.current);
+        return stopped;
     }
 
-    public disconnect(guildId: string): boolean {
+    public disconnect(guildId: string, reason = 'requested'): boolean {
         const session = this.sessions.get(guildId);
         if (!session) return false;
-        return this.closeSession(session, true);
+        return this.closeSession(session, true, reason);
     }
 
     public getSnapshot(guildId: string): AudioQueueSnapshot {
@@ -373,9 +394,10 @@ export class GuildAudioSessionManager {
         });
 
         session.transition = scheduled.catch((error) => {
-            console.error(`Audio state transition failed in guild ${session.guildId}:`, error);
+            log.error('audio.transition_failed', 'Audio state transition failed.', { ...this.sessionFields(session), error });
         });
-        return scheduled;
+        // Return the observed promise, so fire-and-forget callers cannot leak a rejection.
+        return session.transition;
     }
 
     private async awaitReady(
@@ -422,11 +444,7 @@ export class GuildAudioSessionManager {
                     );
                 } else {
                     const estimateMinutes = this.voiceRecoveryPolicy.estimatedDurationMinutes;
-                    console.info(
-                        `Transient voice outage detected in guild ${session.guildId}; ` +
-                        `trying up to ${this.voiceRecoveryPolicy.maxAttempts} recovery attempts over ` +
-                        `about ${estimateMinutes} minutes.`
-                    );
+                    log.warn('voice.recovery_started', 'Transient voice outage; starting recovery.', { ...this.sessionFields(session), recoveryKind, maxAttempts: this.voiceRecoveryPolicy.maxAttempts, estimatedMinutes: estimateMinutes });
                     this.notify(
                         session,
                         `⚠️ **Voice connection interrupted**\n` +
@@ -437,6 +455,7 @@ export class GuildAudioSessionManager {
                     await this.retryTransientRecovery(session, recovery, controller.signal);
                 }
                 this.syncSessionChannel(session);
+                if (this.isRecoveryActive(session, recovery)) log.info('voice.recovery_succeeded', 'Voice connection recovered.', { ...this.sessionFields(session), recoveryKind });
             } catch (error) {
                 if (
                     session.recovery !== recovery ||
@@ -445,19 +464,16 @@ export class GuildAudioSessionManager {
                 ) return;
 
                 if (recoveryKind === 'external-disconnect') {
-                    console.info(
-                        `Voice connection in guild ${session.guildId} was removed externally; ` +
-                        'clearing the audio session.'
-                    );
+                    log.info('voice.removed_externally', 'Voice connection removed externally; clearing session.', this.sessionFields(session));
                     this.notify(
                         session,
                         'ℹ️ **Disconnected from voice**\nThe audio session was cleared.'
                     );
                 } else {
-                    console.error(`Voice connection recovery failed in guild ${session.guildId}:`, error);
+                    log.error('voice.recovery_failed', 'Voice recovery exhausted; clearing session.', { ...this.sessionFields(session), error });
                     this.notify(session, '⚠️ **Voice connection lost**\nThe audio session was cleared.');
                 }
-                this.closeSession(session, true);
+                this.closeSession(session, true, recoveryKind === 'external-disconnect' ? 'external_disconnect' : 'recovery_exhausted');
             } finally {
                 if (session.recovery === recovery) session.recovery = undefined;
             }
@@ -483,9 +499,7 @@ export class GuildAudioSessionManager {
                     throw new Error('No voice server endpoint is available for recovery.');
                 }
                 const networking = state.networking;
-                console.info(
-                    `Voice recovery attempt ${attempt}/${maxAttempts} for guild ${session.guildId}.`
-                );
+                log.info('voice.recovery_attempt', 'Attempting voice recovery.', { ...this.sessionFields(session), attempt, maxAttempts });
                 try {
                     await this.awaitReady(session, attemptSignal);
                 } catch (error) {
@@ -502,17 +516,10 @@ export class GuildAudioSessionManager {
             },
             {
                 onBackoff: (attempt, delayMs) => {
-                    console.info(
-                        `Voice recovery attempt ${attempt}/${this.voiceRecoveryPolicy.maxAttempts} ` +
-                        `for guild ${session.guildId} starts in ${delayMs / 1_000}s.`
-                    );
+                    log.info('voice.recovery_backoff', 'Waiting before voice recovery attempt.', { ...this.sessionFields(session), attempt, delayMs });
                 },
                 onFailure: (attempt, error) => {
-                    console.warn(
-                        `Voice recovery attempt ${attempt}/${this.voiceRecoveryPolicy.maxAttempts} ` +
-                        `failed in guild ${session.guildId}:`,
-                        error
-                    );
+                    log.warn('voice.recovery_attempt_failed', 'Voice recovery attempt failed.', { ...this.sessionFields(session), attempt, maxAttempts: this.voiceRecoveryPolicy.maxAttempts, error });
                 }
             }
         );
@@ -561,10 +568,7 @@ export class GuildAudioSessionManager {
             if (this.sessions.get(session.guildId) !== session || session.closing) return;
 
             const description = VOICE_CLOSE_CODE_DESCRIPTIONS[code] ?? 'Unknown voice close code';
-            console.info(
-                `Voice WebSocket closed in guild ${session.guildId} ` +
-                `(closeCode=${code}, description=${description}).`
-            );
+            log.info('voice.websocket_closed', 'Voice WebSocket closed.', { ...this.sessionFields(session), closeCode: code, description });
 
             if (!TERMINAL_VOICE_CLOSE_CODES.has(code)) return;
 
@@ -574,7 +578,7 @@ export class GuildAudioSessionManager {
                 ? '⚠️ **Discord rate-limited voice**\nThe audio session was cleared.'
                 : 'ℹ️ **Voice call ended**\nThe audio session was cleared.';
             this.notify(session, notification);
-            this.closeSession(session, true);
+            this.closeSession(session, true, code === 4021 ? 'voice_rate_limited' : 'call_terminated');
         });
     }
 
@@ -590,6 +594,7 @@ export class GuildAudioSessionManager {
     }
 
     private startRateLimitCooldown(guildId: string): void {
+        log.warn('voice.cooldown_started', 'Voice connection cooldown started.', { guildId, retryAfterMs: this.rateLimitCooldownMs });
         const expiresAt = Date.now() + this.rateLimitCooldownMs;
         this.rateLimitCooldowns.set(guildId, expiresAt);
 
@@ -612,10 +617,12 @@ export class GuildAudioSessionManager {
         recovery?.controller.abort();
     }
 
-    private closeSession(session: GuildAudioSession, destroyConnection: boolean): boolean {
+    private closeSession(session: GuildAudioSession, destroyConnection: boolean, reason = 'closed'): boolean {
         if (session.closing) return false;
 
         session.closing = true;
+        log.info('audio.session_closed', 'Audio session closed.', { ...this.sessionFields(session), reason });
+        if (session.current) this.endReasons.set(session.current, reason);
         if (this.sessions.get(session.guildId) === session) {
             this.sessions.delete(session.guildId);
         }
@@ -660,8 +667,9 @@ export class GuildAudioSessionManager {
             session.announcementChannel = announcementChannel;
 
             try {
-                const resource = this.takePreload(session, track) ?? this.resources.createTrackResource(track);
+                const resource = this.takePreload(session, track) ?? this.resources.createTrackResource(track, this.sessionFields(session));
                 session.current = resource;
+                log.info('audio.track_submitted', 'Track submitted to audio player.', { ...this.sessionFields(session), trackId: track.id, title: track.title, autoplay: track.autoplay ?? false });
                 session.player.play(resource);
                 this.autoplayCoordinator.recordStartedTrack(
                     session.guildId,
@@ -676,7 +684,8 @@ export class GuildAudioSessionManager {
                 this.reconcilePreload(session);
                 return;
             } catch (error) {
-                console.error(`Failed to play ${track.title} in guild ${session.guildId}:`, error);
+                log.error('audio.track_submit_failed', 'Failed to submit track to audio player.', { ...this.sessionFields(session), trackId: track.id, title: track.title, error });
+                if (session.current) this.endReasons.set(session.current, 'failed');
                 this.releaseCurrent(session);
                 this.notify(
                     session,
@@ -705,8 +714,9 @@ export class GuildAudioSessionManager {
             );
             if (!track) return false;
 
-            resource = this.resources.createTrackResource(track);
+            resource = this.resources.createTrackResource(track, this.sessionFields(session));
             session.current = resource;
+            log.info('audio.track_submitted', 'Autoplay track submitted to audio player.', { ...this.sessionFields(session), trackId: track.id, title: track.title, autoplay: true });
             session.player.play(resource);
             this.autoplayCoordinator.recordStartedTrack(
                 session.guildId,
@@ -720,9 +730,12 @@ export class GuildAudioSessionManager {
             });
             return true;
         } catch (error) {
-            if (resource && session.current === resource) this.releaseCurrent(session);
+            if (resource && session.current === resource) {
+                this.endReasons.set(resource, 'failed');
+                this.releaseCurrent(session);
+            }
             if (!session.closing) {
-                console.error(`Failed to start autoplay in guild ${session.guildId}:`, error);
+                log.error('audio.autoplay_start_failed', 'Failed to start autoplay.', { ...this.sessionFields(session), error });
             }
             return false;
         }
@@ -766,10 +779,11 @@ export class GuildAudioSessionManager {
 
         this.releasePreload(session);
         try {
-            session.preload = this.resources.createTrackResource(nextTrack);
+            log.debug('audio.preload_started', 'Preloading next track.', { ...this.sessionFields(session), trackId: nextTrack.id });
+            session.preload = this.resources.createTrackResource(nextTrack, { ...this.sessionFields(session), phase: 'preload' });
         } catch (error) {
             session.preload = undefined;
-            console.error(`Failed to preload ${nextTrack.title} in guild ${session.guildId}:`, error);
+            log.error('audio.preload_failed', 'Failed to preload track.', { ...this.sessionFields(session), trackId: nextTrack.id, title: nextTrack.title, error });
         }
     }
 
@@ -784,7 +798,7 @@ export class GuildAudioSessionManager {
             session.current = elevatorResource;
             session.player.play(elevatorResource);
         } catch (error) {
-            console.error(`Failed to play elevator music in guild ${session.guildId}:`, error);
+            log.error('audio.elevator_failed', 'Failed to play elevator music.', { ...this.sessionFields(session), error });
         }
 
         if (!session.inactivityTimer) {
@@ -817,7 +831,7 @@ export class GuildAudioSessionManager {
             session.inactivityTimer = undefined;
             if (this.sessions.get(session.guildId) !== session) return;
             if (disconnectMessage) this.notify(session, disconnectMessage);
-            this.disconnect(session.guildId);
+            this.disconnect(session.guildId, 'inactivity');
         }, timeoutMs);
         session.inactivityTimer.unref();
     }
@@ -863,7 +877,10 @@ export class GuildAudioSessionManager {
                 return;
             }
 
-            if (!playbackStartedAt) playbackStartedAt = now;
+            if (!playbackStartedAt) {
+                playbackStartedAt = now;
+                this.logPlaybackStarted(session, resource);
+            }
             if (resource.playbackDuration > lastPlaybackDuration) {
                 lastPlaybackDuration = resource.playbackDuration;
                 lastProgressAt = now;
@@ -888,6 +905,8 @@ export class GuildAudioSessionManager {
         if (session.closing || session.current !== resource) return;
 
         this.clearTrackWatchdog(session);
+        this.endReasons.set(resource, reason);
+        log.warn('audio.watchdog_stopped', 'Watchdog stopped track.', { ...this.sessionFields(session), trackId: resource.metadata.id, title: resource.metadata.title, reason, playbackDurationMs: resource.playbackDuration });
         const title = resource.metadata.kind === 'track'
             ? ` **${escapeMarkdown(resource.metadata.title)}**`
             : '';
@@ -902,6 +921,15 @@ export class GuildAudioSessionManager {
     }
 
     private releaseCurrent(session: GuildAudioSession): void {
+        const resource = session.current;
+        if (resource?.metadata.kind === 'track' && !this.endedResources.has(resource)) {
+            this.endedResources.add(resource);
+            log.info('audio.track_ended', 'Track ended.', {
+                ...this.sessionFields(session), trackId: resource.metadata.id, title: resource.metadata.title,
+                reason: getResourceFailure(resource) ? 'failed' : this.endReasons.get(resource) ?? 'finished',
+                playbackDurationMs: resource.playbackDuration, started: this.startedResources.has(resource)
+            });
+        }
         this.resources.release(session.current);
         session.current = undefined;
     }
@@ -923,8 +951,18 @@ export class GuildAudioSessionManager {
             : { ...message, allowedMentions: { parse: [] } };
 
         void session.announcementChannel?.send(payload).catch((error) => {
-            console.error(`Failed to send audio notification in guild ${session.guildId}:`, error);
+            log.error('audio.notification_failed', 'Failed to send audio notification.', { ...this.sessionFields(session), error });
         });
+    }
+
+    private sessionFields(session: GuildAudioSession): LogFields {
+        return { guildId: session.guildId, voiceChannelId: session.channelId, queueSize: session.queue.size() };
+    }
+
+    private logPlaybackStarted(session: GuildAudioSession, resource: BeanAudioResource): void {
+        if (resource.metadata.kind !== 'track' || this.startedResources.has(resource)) return;
+        this.startedResources.add(resource);
+        log.info('audio.track_started', 'Audio playback started.', { ...this.sessionFields(session), trackId: resource.metadata.id, title: resource.metadata.title, autoplay: resource.metadata.autoplay ?? false });
     }
 
 }

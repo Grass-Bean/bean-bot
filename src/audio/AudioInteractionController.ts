@@ -4,6 +4,8 @@ import {
     MessageFlags
 } from 'discord.js';
 import { VoiceConnection } from '@discordjs/voice';
+import { logger, setCommandOutcome } from '../utility/logger.js';
+import { sendCommandErrorResponse } from '../utility/discordTask.js';
 import {
     GuildAudioSessionManager,
     VoiceConnectionRateLimitError,
@@ -30,11 +32,12 @@ export class AudioInteractionController {
                 ? interaction.member
                 : await interaction.guild.members.fetch(interaction.user.id);
         } catch (error) {
-            console.error(`Failed to resolve member voice state in guild ${interaction.guild.id}:`, error);
-            await this.respond(
+            setCommandOutcome('failed', 'member_fetch_failed');
+            logger.error('voice.member_fetch_failed', 'Failed to resolve member voice state.', { guildId: interaction.guild.id, error });
+            await sendCommandErrorResponse(() => this.respond(
                 interaction,
                 '⚠️ **Couldn’t check your voice channel**\nPlease try again.'
-            );
+            ));
             return undefined;
         }
 
@@ -82,6 +85,8 @@ export class AudioInteractionController {
             );
         } catch (error) {
             if (error instanceof VoiceConnectionRateLimitError) {
+                setCommandOutcome('rate-limited', 'voice_cooldown');
+                logger.warn('voice.connect_rate_limited', 'Voice connection is on cooldown.', { guildId: interaction.guild.id, retryAfterMs: error.retryAfterMs });
                 const retryAfterSeconds = Math.max(1, Math.ceil(error.retryAfterMs / 1_000));
                 await this.respond(
                     interaction,
@@ -90,11 +95,12 @@ export class AudioInteractionController {
                 return undefined;
             }
 
-            console.error(`Failed to connect to voice in guild ${interaction.guild.id}:`, error);
-            await this.respond(
+            setCommandOutcome('failed', 'voice_connect_failed');
+            logger.error('voice.connect_failed', 'Failed to connect to voice.', { guildId: interaction.guild.id, voiceChannelId, error });
+            await sendCommandErrorResponse(() => this.respond(
                 interaction,
                 '❌ **Couldn’t join the voice channel**\nCheck my Connect and Speak permissions, then try again.'
-            );
+            ));
             return undefined;
         }
     }
@@ -108,6 +114,8 @@ export class AudioInteractionController {
         interaction: ChatInputCommandInteraction,
         content: string
     ): Promise<void> {
+        // Failed/rate-limited outcomes set by callers take precedence over validation rejection.
+        setCommandOutcome('rejected', 'voice_requirement');
         const response = {
             content,
             allowedMentions: { parse: [] }

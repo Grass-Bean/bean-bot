@@ -6,7 +6,7 @@
   "main": "index.js",
   "scripts": {
     "build": "rimraf dist && tsc",
-    "start": "node --trace-warnings dist/index.js",
+    "start": "node --enable-source-maps --trace-warnings dist/index.js",
     "dev": "nodemon src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest",

@@ -1,6 +1,7 @@
 import { ChatInputCommandInteraction, MessageFlags, SlashCommandBuilder } from 'discord.js';
 import { audioInteractionController } from '../../audio/AudioInteractionController.js';
 import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
+import { setCommandOutcome } from '../../utility/logger.js';
 
 export default {
     data: new SlashCommandBuilder()
@@ -26,6 +27,7 @@ export default {
         const requested = interaction.options.getBoolean('enabled');
         const enabled = requested ?? !guildAudioSessionManager.isAutoplayEnabled(interaction.guildId);
         if (!guildAudioSessionManager.setAutoplay(interaction.guildId, enabled)) {
+            setCommandOutcome('rejected', 'session_closed');
             await interaction.editReply({
                 content: '❌ **Couldn’t update autoplay**\nThe audio session is no longer active.',
                 allowedMentions: { parse: [] }

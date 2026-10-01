@@ -217,6 +217,7 @@ export type TrackResolverErrorCode =
 export interface TrackResolverOptions {
     timeoutMs?: number;
     maxStdoutBytes?: number;
+    /** @deprecated Diagnostics are now carried by errors and sanitized by the shared logger. */
     logDiagnostics?: boolean;
 }
 

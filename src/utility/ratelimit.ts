@@ -1,3 +1,4 @@
+import { logger } from './logger.js';
 export class RateLimit {
     // Key: "userId:commandName" | Value: Expiration Timestamp (Date.now() + limit)
     private static expirations: Map<string, number> = new Map(); 
@@ -39,7 +40,7 @@ export class RateLimit {
         // (Prevents memory leaks - see note below)
         setTimeout(() => {
             RateLimit.expirations.delete(key);
-            console.log(`-> Cleared rate limit for ${key}`);
+            logger.child({ component: 'cooldown' }, { inheritContext: false }).debug('cooldown.expired', 'Command cooldown expired.', { userId, command: commandName });
         }, limit);
 
         return false;

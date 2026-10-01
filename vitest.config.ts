@@ -5,6 +5,7 @@ export default defineConfig({
         environment: 'node',
         clearMocks: true,
         restoreMocks: true,
+        env: { LOG_FORMAT: 'json', LOG_LEVEL: 'info' },
         coverage: {
             provider: 'v8',
             reporter: ['text', 'json-summary', 'html'],

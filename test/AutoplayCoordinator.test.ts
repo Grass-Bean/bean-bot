@@ -84,4 +84,22 @@ describe('AutoplayCoordinator', () => {
         await expect(selection).resolves.toBeUndefined();
         expect(state.controller).toBeUndefined();
     });
+
+    it('reports a shared prefetch/selection failure once, but reports a later lookup again', async () => {
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const resolver = { resolveAutoplayCandidates: vi.fn().mockRejectedValue(new Error('lookup failed')) };
+        const coordinator = new AutoplayCoordinator({ resolver });
+        const state = coordinator.createState();
+        coordinator.recordStartedTrack('guild-a', state, track('seed'), () => true);
+        coordinator.enable('guild-a', state, () => true);
+        await coordinator.selectNext('guild-a', state, () => true);
+        expect(errors).toHaveBeenCalledOnce();
+        await coordinator.selectNext('guild-a', state, () => true);
+        expect(errors).toHaveBeenCalledTimes(2);
+        expect(errors.mock.calls.map(([line]) => JSON.parse(line))).toEqual([
+            expect.objectContaining({ event: 'autoplay.lookup_failed', guildId: 'guild-a', seedTrackId: 'seed' }),
+            expect.objectContaining({ event: 'autoplay.lookup_failed', guildId: 'guild-a', seedTrackId: 'seed' })
+        ]);
+    });
 });

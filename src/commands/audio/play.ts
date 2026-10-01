@@ -3,6 +3,8 @@ import { audioInteractionController } from '../../audio/AudioInteractionControll
 import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
 import { TrackResolverError, trackResolver } from '../../audio/TrackResolver.js';
 import { createQueuedTrackEmbed } from '../../audio/audioPresentation.js';
+import { logger, addLogContextFields, registerSensitiveText, setCommandOutcome } from '../../utility/logger.js';
+import { sendCommandErrorResponse } from '../../utility/discordTask.js';
 
 const getResolverErrorMessage = (error: TrackResolverError): string => {
     switch (error.code) {
@@ -34,12 +36,14 @@ export default {
         if (!voiceChannelId) return;
 
         const query = interaction.options.getString('query', true);
+        registerSensitiveText(query);
 
         if (!interaction.deferred && !interaction.replied) {
             await interaction.deferReply();
         }
 
         if (guildAudioSessionManager.isQueueFull(guildId)) {
+            setCommandOutcome('rejected', 'queue_full');
             await interaction.editReply({
                 content: '⚠️ **Queue is full**\nThere are already 50 tracks waiting.',
                 allowedMentions: { parse: [] }
@@ -49,6 +53,7 @@ export default {
 
         try {
             const track = await trackResolver.resolve(query, interaction.user.id);
+            addLogContextFields({ trackId: track.id });
             const conn = await audioInteractionController.connect(interaction, voiceChannelId);
             if (!conn) return;
 
@@ -58,6 +63,7 @@ export default {
                 interaction.channel as TextChannel | null
             );
             if (!result.accepted) {
+                setCommandOutcome('rejected', 'queue_full');
                 await interaction.editReply({
                     content: '⚠️ **Queue is full**\nThere are already 50 tracks waiting.',
                     allowedMentions: { parse: [] }
@@ -71,21 +77,17 @@ export default {
             });
 
         } catch (error) {
-            if (error instanceof TrackResolverError) {
-                if (error.code !== 'INVALID_INPUT' && error.code !== 'UNSUPPORTED_URL') {
-                    console.error(`[TrackResolver ${error.code}] ${error.message}`);
-                }
-            } else {
-                console.error(error);
-            }
+            const expected = error instanceof TrackResolverError && ['INVALID_INPUT', 'UNSUPPORTED_URL', 'CANCELLED'].includes(error.code);
+            setCommandOutcome(expected ? 'rejected' : 'failed', error instanceof TrackResolverError ? error.code : 'play_error');
+            logger[expected ? 'info' : 'error']('command.play_failed', 'Could not add the requested track.', { component: 'resolver', error });
 
             const detail = error instanceof TrackResolverError
                 ? getResolverErrorMessage(error)
                 : 'Failed to find or play the requested media.';
-            await interaction.editReply({
+            await sendCommandErrorResponse(() => interaction.editReply({
                 content: `❌ **Couldn’t add that track**\n${detail}`,
                 allowedMentions: { parse: [] }
-            });
+            }));
         }
     }
 }

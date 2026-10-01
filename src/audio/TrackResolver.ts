@@ -10,12 +10,10 @@ import {
     YtDlpProcessError,
     ytDlpProcessManager
 } from './YtDlpProcessManager.js';
-import { sanitizeLogText } from './sanitizeLogText.js';
 import { getMediaKey, getYouTubeVideoId } from './mediaIdentity.js';
 
 export type { TrackResolverErrorCode, TrackResolverOptions } from './types.js';
 
-const MAX_STDERR_BYTES = 8_000;
 const MAX_TIMER_MS = 2_147_483_647;
 const MAX_CONFIGURED_STDOUT_BYTES = 16 * 1024 * 1024;
 const MAX_TRACK_TITLE_CHARACTERS = 200;
@@ -56,10 +54,11 @@ const isYtDlpMetadata = (value: unknown): value is YtDlpMetadata => {
     );
 };
 
-const createCancellationError = (): TrackResolverError => {
+const createCancellationError = (cause?: unknown): TrackResolverError => {
     const error = new TrackResolverError(
         'Track metadata lookup was cancelled.',
-        'CANCELLED'
+        'CANCELLED',
+        cause === undefined ? undefined : { cause }
     );
     error.name = 'AbortError';
     return error;
@@ -130,7 +129,6 @@ const asError = (value: unknown): Error => (
 export class TrackResolver {
     private readonly timeoutMs: number;
     private readonly maxStdoutBytes: number;
-    private readonly logDiagnostics: boolean;
     private readonly processes: YtDlpProcessClient;
 
     public constructor(
@@ -147,7 +145,6 @@ export class TrackResolver {
             options.maxStdoutBytes ?? 1_000_000,
             MAX_CONFIGURED_STDOUT_BYTES
         );
-        this.logDiagnostics = options.logDiagnostics ?? false;
         this.processes = processes;
     }
 
@@ -175,7 +172,6 @@ export class TrackResolver {
             data = JSON.parse(stdout.toString('utf8'));
         } catch (error) {
             const cause = asError(error);
-            console.error('[yt-dlp Parse Error] Failed to parse metadata JSON.');
             throw new TrackResolverError(
                 'yt-dlp returned malformed metadata.',
                 'INVALID_RESPONSE',
@@ -288,7 +284,6 @@ export class TrackResolver {
     private mapProcessError(error: unknown): TrackResolverError {
         if (!(error instanceof YtDlpProcessError)) {
             const cause = asError(error);
-            this.logProcessError(cause);
             return new TrackResolverError(
                 'Track metadata process failed.',
                 'PROCESS_FAILURE',
@@ -296,19 +291,19 @@ export class TrackResolver {
             );
         }
 
-        if (error.code === 'CANCELLED') return createCancellationError();
+        if (error.code === 'CANCELLED') return createCancellationError(error);
         if (error.code === 'TIMEOUT') {
-            return new TrackResolverError('Track metadata lookup timed out.', 'TIMEOUT');
+            return new TrackResolverError('Track metadata lookup timed out.', 'TIMEOUT', { cause: error });
         }
         if (error.code === 'OUTPUT_LIMIT') {
             return new TrackResolverError(
                 'Track metadata response exceeded the configured size limit.',
-                'OUTPUT_LIMIT'
+                'OUTPUT_LIMIT',
+                { cause: error }
             );
         }
 
         if (error.code === 'PROCESS_FAILURE') {
-            this.logYtDlpFailure(error.message, error.stderr);
             return new TrackResolverError(
                 'Failed to fetch track metadata.',
                 'PROCESS_FAILURE',
@@ -316,11 +311,10 @@ export class TrackResolver {
             );
         }
 
-        this.logProcessError(error.cause instanceof Error ? error.cause : error);
         return new TrackResolverError(
             'Track metadata process failed.',
             'PROCESS_FAILURE',
-            { cause: error.cause ?? error }
+            { cause: error }
         );
     }
 
@@ -395,38 +389,6 @@ export class TrackResolver {
         }
 
         return `ytsearch10:${seed.title} official audio`;
-    }
-
-    private logYtDlpFailure(outcome: string, stderrData: Buffer): void {
-        console.error(`[yt-dlp Error] ${outcome}`);
-        if (!this.logDiagnostics) return;
-
-        const details = sanitizeLogText(
-            this.redactSensitiveUrls(stderrData.toString('utf8')),
-            MAX_STDERR_BYTES
-        );
-        if (details) console.error('[yt-dlp Diagnostic]', details);
-    }
-
-    private logProcessError(error: Error): void {
-        const code = (error as NodeJS.ErrnoException).code;
-        const summary = sanitizeLogText(
-            this.redactSensitiveUrls(error.message),
-            500
-        );
-        console.error(`[yt-dlp Process Error${code ? ` ${code}` : ''}] ${summary}`);
-    }
-
-    private redactSensitiveUrls(value: string): string {
-        return value.replace(/https?:\/\/[^\s"'<>]+/gi, rawUrl => {
-            try {
-                const url = new URL(rawUrl);
-                const redactedQuery = url.search ? '?[redacted]' : '';
-                return `${url.protocol}//${url.host}${url.pathname}${redactedQuery}`;
-            } catch {
-                return '[redacted URL]';
-            }
-        });
     }
 
 }

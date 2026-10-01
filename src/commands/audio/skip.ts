@@ -6,6 +6,7 @@ import {
 } from 'discord.js';
 import { audioInteractionController } from '../../audio/AudioInteractionController.js';
 import { guildAudioSessionManager } from '../../audio/GuildAudioSessionManager.js';
+import { setCommandOutcome } from '../../utility/logger.js';
 
 export default {
     data: new SlashCommandBuilder()
@@ -16,6 +17,7 @@ export default {
 
         const current = guildAudioSessionManager.getSnapshot(interaction.guildId!).current;
         if (!guildAudioSessionManager.skip(interaction.guildId!)) {
+            setCommandOutcome('rejected', 'nothing_playing');
             return interaction.reply({ 
                 content: 'ℹ️ **Nothing is playing**\nAdd something with `/play`.',
                 flags: MessageFlags.Ephemeral 

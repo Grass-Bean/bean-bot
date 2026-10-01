@@ -31,6 +31,8 @@ import {
 import { AutoplaySelector } from '../src/audio/AutoplaySelector.js';
 import { VoiceRecoveryPolicy } from '../src/audio/VoiceRecoveryPolicy.js';
 import type { AudioResourceManager } from '../src/audio/AudioResourceManager.js';
+import { reportResourceFailure } from '../src/audio/AudioResourceManager.js';
+import { runWithLogContext } from '../src/utility/logger.js';
 import type {
     AutoplayTrackResolver,
     BeanAudioResource,
@@ -253,7 +255,7 @@ describe('GuildAudioSessionManager', () => {
             accepted: true, startsImmediately: false, position: 1
         });
         await flushTransitions();
-        expect(resources.createTrackResource).toHaveBeenCalledWith(makeTrack('two'));
+        expect(resources.createTrackResource).toHaveBeenCalledWith(makeTrack('two'), expect.objectContaining({ guildId: 'guild-a', phase: 'preload' }));
         expect(manager.getSnapshot('guild-a')).toEqual({
             current: makeTrack('one'),
             pending: [makeTrack('two')]
@@ -479,7 +481,7 @@ describe('GuildAudioSessionManager', () => {
 
         expect(resources.release).toHaveBeenCalledWith(stalePreload);
         expect(resources.createTrackResource).toHaveBeenCalledTimes(3);
-        expect(resources.createTrackResource).toHaveBeenLastCalledWith(makeTrack('two'));
+        expect(resources.createTrackResource).toHaveBeenLastCalledWith(makeTrack('two'), expect.objectContaining({ guildId: 'guild-a' }));
         expect(player.play).not.toHaveBeenLastCalledWith(stalePreload);
     });
 
@@ -498,8 +500,7 @@ describe('GuildAudioSessionManager', () => {
         await flushTransitions();
 
         expect(errorSpy).toHaveBeenCalledWith(
-            expect.stringContaining('Failed to preload Track two'),
-            expect.any(Error)
+            expect.stringContaining('audio.preload_failed')
         );
         expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({
             metadata: expect.objectContaining({ id: 'two' })
@@ -579,16 +580,13 @@ describe('GuildAudioSessionManager', () => {
         connection.emit('error', new Error('voice failed'));
         await flushTransitions();
         expect(errorSpy).toHaveBeenCalledWith(
-            expect.stringContaining('Audio player error'),
-            expect.anything()
+            expect.stringContaining('audio.player_failed')
         );
         expect(errorSpy).toHaveBeenCalledWith(
-            expect.stringContaining('Voice connection error'),
-            expect.any(Error)
+            expect.stringContaining('voice.connection_error')
         );
         await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
-            expect.stringContaining('Failed to send audio notification'),
-            expect.any(Error)
+            expect.stringContaining('audio.notification_failed')
         ));
     });
 
@@ -620,6 +618,9 @@ describe('GuildAudioSessionManager', () => {
         );
         expect(manager.getActiveChannelId('guild-a')).toBe('voice-recovered');
         expect(infoSpy).toHaveBeenCalled();
+        expect(infoSpy.mock.calls.map(([line]) => JSON.parse(line))).toEqual(expect.arrayContaining([
+            expect.objectContaining({ event: 'voice.recovery_succeeded', guildId: 'guild-a' })
+        ]));
     });
 
     it('keeps the session when a ready state cancels an in-flight recovery', async () => {
@@ -680,8 +681,7 @@ describe('GuildAudioSessionManager', () => {
         expect(connection.configureNetworking).toHaveBeenCalledTimes(5);
         expect(connection.rejoin).not.toHaveBeenCalled();
         expect(errorSpy).toHaveBeenCalledWith(
-            expect.stringContaining('Voice connection recovery failed'),
-            expect.any(Error)
+            expect.stringContaining('voice.recovery_failed')
         );
         expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
             content: expect.stringContaining('Voice connection lost')
@@ -689,6 +689,37 @@ describe('GuildAudioSessionManager', () => {
         expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
             content: expect.stringContaining('about 2 minutes')
         }));
+    });
+
+    it('logs actual playback once and a failed end without repeating a source error', async () => {
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+        await runWithLogContext({ interactionId: 'old-command' }, () => manager.connect('guild-a', 'voice-a', {} as any));
+        manager.enqueue('guild-a', makeTrack('one'), null);
+        await flushTransitions();
+        const resource = resources.createTrackResource.mock.results[0].value;
+        expect(info.mock.calls.filter(([line]) => JSON.parse(line).event === 'audio.track_started')).toHaveLength(0);
+        player.emit('stateChange', { status: 'buffering' }, { status: AudioPlayerStatus.Playing, resource });
+        player.emit('stateChange', { status: 'buffering' }, { status: AudioPlayerStatus.Playing, resource });
+        reportResourceFailure(resource, new Error('source error'), { guildId: 'guild-a' });
+        player.emit('error', Object.assign(new Error('wrapped error'), { resource }));
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+        expect(errors).toHaveBeenCalledOnce();
+        const records = info.mock.calls.map(([line]) => JSON.parse(line));
+        expect(records.filter(record => record.event === 'audio.track_started')).toHaveLength(1);
+        expect(records.find(record => record.event === 'audio.track_ended')).toMatchObject({ reason: 'failed', started: true, trackId: 'one' });
+        expect(records.every(record => !('interactionId' in record))).toBe(true);
+    });
+
+    it('observes failed scheduled work without an unhandled rejection', async () => {
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        const session = (manager as any).sessions.get('guild-a');
+        await expect((manager as any).schedule(session, async () => { throw new Error('transition failure'); })).resolves.toBeUndefined();
+        expect(errors.mock.calls.map(([line]) => JSON.parse(line))).toEqual([
+            expect.objectContaining({ event: 'audio.transition_failed', guildId: 'guild-a', error: expect.objectContaining({ message: 'transition failure' }) })
+        ]);
     });
 
     it('recovers a transient outage on a later backoff attempt', async () => {
@@ -962,6 +993,8 @@ describe('GuildAudioSessionManager', () => {
     });
 
     it('watchdog stops a track that never starts and falls back when stop returns false', async () => {
+        const warnings = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
         vi.useFakeTimers();
         manager = createManager({
             trackStartupTimeoutMs: 10,
@@ -985,6 +1018,12 @@ describe('GuildAudioSessionManager', () => {
         expect(resources.release).toHaveBeenCalledWith(expect.objectContaining({
             metadata: expect.objectContaining({ id: 'one' })
         }));
+        expect(warnings.mock.calls.map(([line]) => JSON.parse(line))).toEqual([
+            expect.objectContaining({ event: 'audio.watchdog_stopped', guildId: 'guild-a', trackId: 'one', reason: 'Playback didn’t start in time' })
+        ]);
+        expect(info.mock.calls.map(([line]) => JSON.parse(line))).toEqual(expect.arrayContaining([
+            expect.objectContaining({ event: 'audio.track_ended', trackId: 'one', started: false, reason: 'Playback didn’t start in time' })
+        ]));
     });
 
     it('watchdog stops playback that stops making progress and lets idle release it', async () => {

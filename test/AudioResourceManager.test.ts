@@ -11,7 +11,8 @@ vi.mock('@discordjs/voice', async (importOriginal) => {
 });
 
 import { StreamType } from '@discordjs/voice';
-import { AudioResourceManager } from '../src/audio/AudioResourceManager.js';
+import { AudioResourceManager, getResourceFailure, reportResourceFailure } from '../src/audio/AudioResourceManager.js';
+import { runWithLogContext } from '../src/utility/logger.js';
 import { YtDlpProcessError } from '../src/audio/YtDlpProcessManager.js';
 import type {
     BeanAudioResource,
@@ -154,9 +155,9 @@ describe('AudioResourceManager', () => {
         await Promise.resolve();
 
         expect(destroySpy).toHaveBeenCalledWith(expect.objectContaining({
-            message: 'Failed to start yt-dlp: private  detail'
+            message: 'Failed to start yt-dlp', cause: expect.objectContaining({ code: 'SPAWN_FAILURE' })
         }));
-        expect(errorSpy).toHaveBeenCalledWith('[yt-dlp] Track  A:', expect.any(String));
+        expect(JSON.parse(errorSpy.mock.calls[0][0])).toMatchObject({ event: 'audio.source_failed', title: 'Track  A', error: { cause: { code: 'SPAWN_FAILURE', diagnostic: 'private  detail' } } });
         expect(handle.stop).not.toHaveBeenCalled();
     });
 
@@ -167,6 +168,37 @@ describe('AudioResourceManager', () => {
 
         expect(() => manager.createTrackResource(track)).toThrow('bad resource');
         expect(handle.stop).toHaveBeenCalledOnce();
+    });
+
+    it('reports a 403 preload failure once per resource and keeps independent failures visible', async () => {
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        for (let index = 0; index < 2; index++) {
+            const { handle, complete } = createHandle();
+            const resource = createResource();
+            createAudioResourceMock.mockReturnValue(resource);
+            runWithLogContext({ interactionId: 'unrelated-command' }, () => {
+                new AudioResourceManager({ processes: createProcesses(handle) })
+                    .createTrackResource(track, { guildId: 'guild-a', voiceChannelId: 'voice-a', phase: 'preload' });
+            });
+            complete({ status: 'failed', exitCode: 1, signal: null, error: new YtDlpProcessError(
+                'yt-dlp closed with code 1', 'PROCESS_FAILURE',
+                Buffer.from('HTTP Error 403: Forbidden\nhttps://user:pass@host/path?signed=private')
+            ) });
+            await handle.completion;
+            await Promise.resolve();
+            expect(getResourceFailure(resource)).toBeInstanceOf(Error);
+            // Discord replaces the original error object but preserves the resource.
+            reportResourceFailure(resource, new Error('wrapped player error'), { guildId: 'guild-a' }, 'audio.player_failed');
+        }
+        expect(errors).toHaveBeenCalledTimes(2);
+        for (const [line] of errors.mock.calls) {
+            const record = JSON.parse(line);
+            expect(record).toMatchObject({ event: 'audio.source_failed', guildId: 'guild-a', phase: 'preload', error: { exitCode: 1, signal: null, cause: { code: 'PROCESS_FAILURE', httpStatus: 403 } } });
+            expect(record).not.toHaveProperty('interactionId');
+            expect(line).not.toContain('user:pass');
+            expect(line).not.toContain('signed=private');
+            expect(line).not.toContain('playStream');
+        }
     });
 
     it('creates quiet elevator music from the configured path', () => {

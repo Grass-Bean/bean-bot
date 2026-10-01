@@ -12,6 +12,22 @@ import type {
 } from './types.js';
 import { ytDlpProcessManager } from './YtDlpProcessManager.js';
 import { sanitizeLogText } from './sanitizeLogText.js';
+import { logger, type LogFields } from '../utility/logger.js';
+
+const failures = new WeakMap<BeanAudioResource, Error>();
+const log = logger.child({ component: 'audio' }, { inheritContext: false });
+
+export const getResourceFailure = (resource: BeanAudioResource): Error | undefined => failures.get(resource);
+
+/** The library wraps stream errors without preserving their cause; key by resource. */
+export function reportResourceFailure(resource: BeanAudioResource, error: Error, context: LogFields, event = 'audio.source_failed'): void {
+    if (failures.has(resource)) return;
+    failures.set(resource, error);
+    log.error(event, 'Audio resource failed.', {
+        ...context, trackId: resource.metadata?.id, title: resource.metadata?.title,
+        requestedBy: resource.metadata?.kind === 'track' ? resource.metadata.requestedBy : undefined, error
+    });
+}
 
 const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
 const defaultElevatorMusicPath = path.resolve(moduleDirectory, '../../assets/elevator.mp3');
@@ -27,7 +43,7 @@ export class AudioResourceManager {
         this.elevatorMusicPath = options.elevatorMusicPath ?? defaultElevatorMusicPath;
     }
 
-    public createTrackResource(metadata: TrackMetadata): BeanAudioResource {
+    public createTrackResource(metadata: TrackMetadata, context: LogFields = {}): BeanAudioResource {
         const ytProcess = this.processes.stream([
             '--ignore-config',
             '--no-playlist',
@@ -44,12 +60,11 @@ export class AudioResourceManager {
 
         const describeFailure = (error: YtDlpProcessFailure) => {
             const safeSummary = sanitizeLogText(error.message, 500);
-            const details = sanitizeLogText(error.stderr.toString('utf8'), 8_000);
-            return new Error(details ? `${safeSummary}: ${details}` : safeSummary);
+            return new Error(safeSummary, { cause: error });
         };
 
         const failResource = (error: Error) => {
-            console.error(`[yt-dlp] ${sanitizeLogText(metadata.title, 200)}:`, error.message);
+            if (resource) reportResourceFailure(resource, error, { ...context, autoplay: metadata.autoplay ?? false });
 
             if (resource && !resource.playStream.destroyed) {
                 resource.playStream.destroy(error);
@@ -57,7 +72,11 @@ export class AudioResourceManager {
         };
 
         void ytProcess.completion.then(outcome => {
-            if (outcome.status === 'failed') failResource(describeFailure(outcome.error));
+            if (outcome.status === 'failed') {
+                failResource(Object.assign(describeFailure(outcome.error), {
+                    exitCode: outcome.exitCode, signal: outcome.signal
+                }));
+            }
         });
 
         try {

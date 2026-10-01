@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import type { BotCommand } from './commandTypes.js';
+import { logger } from './utility/logger.js';
 
 export interface LoadedCommand {
     command: BotCommand;
@@ -49,14 +50,13 @@ export const loadCommands = async (directory: string): Promise<LoadedCommand[]> 
         const command = commandModule.default;
 
         if (!isBotCommand(command)) {
-            console.warn(
-                `[WARNING] The command at ${filePath} is missing valid data or an execute function.`
-            );
+            logger.warn('commands.invalid_module', 'Command module is missing valid data or execute.', { filePath });
             continue;
         }
 
         commands.push({ command, filePath });
     }
 
+    logger.info('commands.loaded', 'Command modules loaded.', { count: commands.length });
     return commands;
 };

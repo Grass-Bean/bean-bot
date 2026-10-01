@@ -31,7 +31,7 @@ describe('RateLimit', () => {
     });
 
     it('isolates cooldowns by user and command and removes expired entries', () => {
-        const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+        const log = vi.spyOn(console, 'info').mockImplementation(() => undefined);
         const limits = new RateLimit();
         limits.setLimit('queue', 100);
         limits.setLimit('disconnect', 200);
@@ -44,7 +44,7 @@ describe('RateLimit', () => {
         expect(limits.getTimeLeft('user-a', 'queue')).toBeUndefined();
         expect(limits.isRateLimited('user-a', 'queue')).toBe(false);
         expect(limits.getTimeLeft('user-a', 'disconnect')).toBe(100);
-        expect(log).toHaveBeenCalledWith('-> Cleared rate limit for user-a:queue');
+        expect(log).not.toHaveBeenCalled(); // Cooldown housekeeping is debug-only.
     });
 
     it('shares configured limits and active cooldowns across instances', () => {
