@@ -444,11 +444,11 @@ export class GuildAudioSessionManager {
                     );
                 } else {
                     const estimateMinutes = this.voiceRecoveryPolicy.estimatedDurationMinutes;
-                    log.warn('voice.recovery_started', 'Transient voice outage; starting recovery.', { ...this.sessionFields(session), recoveryKind, maxAttempts: this.voiceRecoveryPolicy.maxAttempts, estimatedMinutes: estimateMinutes });
+                    log.warn('voice.recovery_started', 'Voice connection interrupted; starting recovery.', { ...this.sessionFields(session), recoveryKind, maxAttempts: this.voiceRecoveryPolicy.maxAttempts, estimatedMinutes: estimateMinutes });
                     this.notify(
                         session,
                         `⚠️ **Voice connection interrupted**\n` +
-                        `Discord may be having an outage. Retrying up to ` +
+                        `Reconnecting automatically. Retrying up to ` +
                         `${this.voiceRecoveryPolicy.maxAttempts} times over about ` +
                         `${estimateMinutes} minutes.`
                     );
