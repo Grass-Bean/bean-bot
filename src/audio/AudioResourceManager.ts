@@ -35,6 +35,7 @@ const defaultElevatorMusicPath = path.resolve(moduleDirectory, '../../assets/ele
 export class AudioResourceManager {
     private readonly releasers = new WeakMap<BeanAudioResource, () => void>();
     private readonly releasedResources = new WeakSet<BeanAudioResource>();
+    private readonly deliberatelyReleasedResources = new WeakSet<BeanAudioResource>();
     private readonly processes: YtDlpProcessClient;
     private readonly elevatorMusicPath: string;
 
@@ -64,6 +65,7 @@ export class AudioResourceManager {
         };
 
         const failResource = (error: Error) => {
+            if (resource && this.deliberatelyReleasedResources.has(resource)) return;
             if (resource) reportResourceFailure(resource, error, { ...context, autoplay: metadata.autoplay ?? false });
 
             if (resource && !resource.playStream.destroyed) {
@@ -112,7 +114,9 @@ export class AudioResourceManager {
     }
 
     public release(resource: BeanAudioResource | undefined): void {
-        if (!resource || this.releasedResources.has(resource)) return;
+        if (!resource) return;
+        this.deliberatelyReleasedResources.add(resource);
+        if (this.releasedResources.has(resource)) return;
 
         const release = this.releasers.get(resource);
         if (release) {

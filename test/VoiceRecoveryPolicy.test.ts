@@ -47,6 +47,21 @@ describe('VoiceRecoveryPolicy', () => {
         expect(policy.estimatedDurationMinutes).toBe(1);
     });
 
+    it('reports a readiness timeout explicitly instead of a generic abort', async () => {
+        vi.useFakeTimers();
+        const policy = new VoiceRecoveryPolicy({ maxAttempts: 1, attemptTimeoutMs: 20 });
+        const onFailure = vi.fn();
+        const recovery = policy.recover(new AbortController().signal, ({ signal }) => new Promise((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(new Error('The operation was aborted')), { once: true });
+        }), { onFailure });
+        const rejection = expect(recovery).rejects.toMatchObject({
+            name: 'TimeoutError', message: 'Voice recovery attempt timed out after 20 ms.'
+        });
+        await vi.advanceTimersByTimeAsync(20);
+        await rejection;
+        expect(onFailure).toHaveBeenCalledWith(1, expect.objectContaining({ name: 'TimeoutError' }));
+    });
+
     it('cancels cleanly during backoff', async () => {
         vi.useFakeTimers();
         const controller = new AbortController();

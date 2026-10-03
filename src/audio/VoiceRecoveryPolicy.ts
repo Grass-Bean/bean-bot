@@ -86,11 +86,16 @@ export class VoiceRecoveryPolicy {
         const abortAttempt = () => attemptController.abort();
         recoverySignal.addEventListener('abort', abortAttempt, { once: true });
 
-        const timeout = setTimeout(abortAttempt, this.attemptTimeoutMs);
+        const timeoutError = new Error(`Voice recovery attempt timed out after ${this.attemptTimeoutMs} ms.`);
+        timeoutError.name = 'TimeoutError';
+        const timeout = setTimeout(() => attemptController.abort(timeoutError), this.attemptTimeoutMs);
         timeout.unref();
 
         try {
             await operation(attemptController.signal);
+        } catch (error) {
+            if (attemptController.signal.aborted) throw attemptController.signal.reason;
+            throw error;
         } finally {
             clearTimeout(timeout);
             recoverySignal.removeEventListener('abort', abortAttempt);

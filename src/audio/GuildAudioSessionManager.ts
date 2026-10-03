@@ -51,6 +51,7 @@ const VOICE_CLOSE_CODE_DESCRIPTIONS: Readonly<Record<number, string>> = {
 };
 
 const TERMINAL_VOICE_CLOSE_CODES = new Set([4021, 4022]);
+const INVALID_VOICE_SESSION_CLOSE_CODES = new Set([4006, 4009]);
 const log = logger.child({ component: 'audio' }, { inheritContext: false });
 
 export interface GuildAudioSessionManagerOptions {
@@ -83,6 +84,7 @@ export class GuildAudioSessionManager {
     private readonly endedResources = new WeakSet<BeanAudioResource>();
     private readonly endReasons = new WeakMap<BeanAudioResource, string>();
     private readonly observedNetworkingInstances = new WeakSet<object>();
+    private readonly replacedConnections = new WeakSet<VoiceConnection>();
     private readonly rateLimitCooldowns = new Map<string, number>();
     private readonly resources: AudioResourceManager;
     private readonly inactivityTimeoutMs: number;
@@ -144,18 +146,18 @@ export class GuildAudioSessionManager {
             selfMute: false
         });
         const player = createAudioPlayer();
-        let readyReported = false;
         log.info('voice.connecting', 'Joining voice channel.', { guildId, voiceChannelId: channelId });
         const session: GuildAudioSession = {
             guildId,
             channelId,
             connection,
+            adapterCreator,
             player,
             queue: new Deque<QueuedTrack>(),
             announcementChannel: null,
             transition: Promise.resolve(),
             autoplay: this.autoplayCoordinator.createState(),
-            hasBeenReady: connection.state.status === VoiceConnectionStatus.Ready,
+            hasBeenReady: false,
             closing: false
         };
 
@@ -184,14 +186,37 @@ export class GuildAudioSessionManager {
             }
         });
 
-        connection.on('error', (error) => {
-            log.error('voice.connection_error', 'Voice connection error.', { ...this.sessionFields(session), error });
-        });
         player.on('stateChange', (_oldState, newState) => {
             log.debug('audio.player_state', 'Audio player state changed.', { ...this.sessionFields(session), state: newState.status });
             if (newState.status === AudioPlayerStatus.Playing) this.logPlaybackStarted(session, newState.resource as BeanAudioResource);
         });
+        this.observeConnection(session);
+        connection.subscribe(player);
+        this.sessions.set(guildId, session);
+
+        try {
+            const readyConnection = await this.awaitReady(session);
+            if (!session.hasBeenReady) log.info('voice.ready', 'Voice connection ready.', this.sessionFields(session));
+            session.hasBeenReady = true;
+            this.scheduleInactivityDisconnect(session, this.emptySessionTimeoutMs);
+            return readyConnection;
+        } catch (error) {
+            this.closeSession(session, true, 'connect_failed');
+            throw error;
+        }
+    }
+
+    private observeConnection(session: GuildAudioSession): void {
+        const connection = session.connection;
+        const isCurrent = () => session.connection === connection &&
+            !session.closing && !this.replacedConnections.has(connection);
+
+        connection.on('error', (error) => {
+            if (!isCurrent()) return;
+            log.error('voice.connection_error', 'Voice connection error.', { ...this.sessionFields(session), error });
+        });
         connection.on('stateChange', (oldState, newState) => {
+            if (!isCurrent()) return;
             this.syncSessionChannel(session);
             log.debug('voice.state_changed', 'Voice state changed.', { ...this.sessionFields(session), oldState: oldState.status, state: newState.status });
 
@@ -204,7 +229,7 @@ export class GuildAudioSessionManager {
                 return;
             }
             if (newState.status === VoiceConnectionStatus.Ready) {
-                readyReported = true;
+                session.needsFreshVoiceSession = false;
                 log.info('voice.ready', 'Voice connection ready.', this.sessionFields(session));
                 if (session.recovery) log.info('voice.recovery_succeeded', 'Voice connection recovered.', { ...this.sessionFields(session), recoveryKind: session.recovery.kind });
                 session.hasBeenReady = true;
@@ -236,12 +261,12 @@ export class GuildAudioSessionManager {
                     }
                 }
 
-                void this.recoverConnection(session, recoveryKind);
+                // Let the library finish its state transition before replacing a connection.
+                queueMicrotask(() => {
+                    if (isCurrent()) void this.recoverConnection(session, recoveryKind);
+                });
             }
         });
-
-        connection.subscribe(player);
-        this.sessions.set(guildId, session);
 
         const initialConnectionState = connection.state;
         if (
@@ -249,17 +274,6 @@ export class GuildAudioSessionManager {
             initialConnectionState.status === VoiceConnectionStatus.Ready
         ) {
             this.observeNetworkingClose(session, initialConnectionState.networking);
-        }
-
-        try {
-            const readyConnection = await this.awaitReady(session);
-            if (!readyReported) log.info('voice.ready', 'Voice connection ready.', this.sessionFields(session));
-            session.hasBeenReady = true;
-            this.scheduleInactivityDisconnect(session, this.emptySessionTimeoutMs);
-            return readyConnection;
-        } catch (error) {
-            this.closeSession(session, true, 'connect_failed');
-            throw error;
         }
     }
 
@@ -419,7 +433,9 @@ export class GuildAudioSessionManager {
         session: GuildAudioSession,
         recoveryKind: VoiceRecoveryKind = 'transient'
     ): Promise<void> {
-        if (session.closing) return;
+        if (session.closing || (
+            session.connection.state.status === VoiceConnectionStatus.Ready && !session.needsFreshVoiceSession
+        )) return;
 
         const existingRecovery = session.recovery;
         if (existingRecovery?.kind === recoveryKind) return existingRecovery.promise;
@@ -491,27 +507,40 @@ export class GuildAudioSessionManager {
             signal,
             async ({ attempt, maxAttempts, signal: attemptSignal }) => {
                 if (!this.isRecoveryActive(session, recovery)) return;
-                // A rejoin only sends a gateway payload. Recreate networking
-                // on every attempt to open a fresh voice WebSocket.
-                session.connection.configureNetworking();
+                const freshSession = session.needsFreshVoiceSession === true;
+                if (freshSession) {
+                    this.replaceVoiceConnection(session);
+                } else {
+                    // Socket retries are sufficient while the session remains valid.
+                    session.connection.configureNetworking();
+                }
+                const connection = session.connection;
                 const state = session.connection.state;
-                if (state.status !== VoiceConnectionStatus.Connecting) {
+                if (!freshSession && state.status !== VoiceConnectionStatus.Connecting) {
                     throw new Error('No voice server endpoint is available for recovery.');
                 }
-                const networking = state.networking;
-                log.info('voice.recovery_attempt', 'Attempting voice recovery.', { ...this.sessionFields(session), attempt, maxAttempts });
+                const networking = state.status === VoiceConnectionStatus.Connecting ? state.networking : undefined;
+                const invalidation = new AbortController();
+                const interruptAttempt = (error: Error) => invalidation.abort(error);
+                recovery.interruptAttempt = interruptAttempt;
+                log.info('voice.recovery_attempt', 'Attempting voice recovery.', { ...this.sessionFields(session), attempt, maxAttempts, freshSession });
                 try {
-                    await this.awaitReady(session, attemptSignal);
+                    await this.awaitReady(session, AbortSignal.any([attemptSignal, invalidation.signal]));
+                    session.needsFreshVoiceSession = false;
                 } catch (error) {
                     const currentState = session.connection.state;
                     if (
                         this.isRecoveryActive(session, recovery) &&
+                        session.connection === connection &&
                         currentState.status === VoiceConnectionStatus.Connecting &&
-                        currentState.networking === networking
+                        (freshSession || currentState.networking === networking)
                     ) {
-                        networking.destroy();
+                        currentState.networking.destroy();
                     }
+                    if (invalidation.signal.aborted) throw invalidation.signal.reason;
                     throw error;
+                } finally {
+                    if (recovery.interruptAttempt === interruptAttempt) recovery.interruptAttempt = undefined;
                 }
             },
             {
@@ -523,6 +552,23 @@ export class GuildAudioSessionManager {
                 }
             }
         );
+    }
+
+    private replaceVoiceConnection(session: GuildAudioSession): void {
+        const oldConnection = session.connection;
+        this.syncSessionChannel(session);
+        const joinConfig = { ...oldConnection.joinConfig, channelId: session.channelId };
+        // Destroying the old connection must not dispose the audio session.
+        this.replacedConnections.add(oldConnection);
+        if (oldConnection.state.status !== VoiceConnectionStatus.Destroyed) oldConnection.destroy();
+        session.connection = joinVoiceChannel({
+            ...joinConfig,
+            guildId: session.guildId,
+            adapterCreator: session.adapterCreator
+        });
+        this.observeConnection(session);
+        session.connection.subscribe(session.player);
+        log.info('voice.session_rejoining', 'Joining voice with a fresh session.', this.sessionFields(session));
     }
 
     private async awaitRecoveryAttempt(
@@ -561,14 +607,30 @@ export class GuildAudioSessionManager {
     ): void {
         if (this.observedNetworkingInstances.has(networking)) return;
         this.observedNetworkingInstances.add(networking);
+        const connection = session.connection;
 
         // Run before @discordjs/voice's close listener so terminal close codes do
         // not trigger the library's generic rejoin path.
         networking.prependOnceListener('close', (code) => {
-            if (this.sessions.get(session.guildId) !== session || session.closing) return;
+            if (
+                this.sessions.get(session.guildId) !== session || session.closing ||
+                session.connection !== connection || this.replacedConnections.has(connection) ||
+                !('networking' in connection.state) || connection.state.networking !== networking
+            ) return;
 
             const description = VOICE_CLOSE_CODE_DESCRIPTIONS[code] ?? 'Unknown voice close code';
             log.info('voice.websocket_closed', 'Voice WebSocket closed.', { ...this.sessionFields(session), closeCode: code, description });
+
+            if (INVALID_VOICE_SESSION_CLOSE_CODES.has(code)) {
+                session.needsFreshVoiceSession = true;
+                session.recovery?.interruptAttempt?.(new Error(`Voice session rejected by Discord (${code}: ${description}).`));
+                if (session.hasBeenReady) {
+                    queueMicrotask(() => {
+                        if (session.connection === connection && !session.closing) void this.recoverConnection(session);
+                    });
+                }
+                return;
+            }
 
             if (!TERMINAL_VOICE_CLOSE_CODES.has(code)) return;
 

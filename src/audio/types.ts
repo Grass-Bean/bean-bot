@@ -1,6 +1,7 @@
 import type {
     AudioPlayer,
     AudioResource,
+    DiscordGatewayAdapterCreator,
     VoiceConnection
 } from '@discordjs/voice';
 import type { TextChannel } from 'discord.js';
@@ -87,12 +88,15 @@ export interface VoiceRecovery {
     kind: VoiceRecoveryKind;
     controller: AbortController;
     promise: Promise<void>;
+    interruptAttempt?: (error: Error) => void;
 }
 
 export interface GuildAudioSession {
     guildId: string;
     channelId: string;
     connection: VoiceConnection;
+    adapterCreator: DiscordGatewayAdapterCreator;
+    needsFreshVoiceSession?: boolean;
     player: AudioPlayer;
     queue: Deque<QueuedTrack>;
     current?: BeanAudioResource;

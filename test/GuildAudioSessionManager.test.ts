@@ -75,7 +75,9 @@ const createConnection = (
         return networking;
     });
     connection.destroy = vi.fn(() => {
+        const oldState = connection.state;
         connection.state = { status: VoiceConnectionStatus.Destroyed };
+        connection.emit('stateChange', oldState, connection.state);
     });
     return connection;
 };
@@ -878,6 +880,181 @@ describe('GuildAudioSessionManager', () => {
         expect(channel.send).toHaveBeenCalledWith(expect.objectContaining({
             content: expect.stringContaining('Disconnected from voice')
         }));
+    });
+
+    it.each([4006, 4009])('rejoins with fresh credentials after voice close %i and preserves playback', async (code) => {
+        vi.spyOn(console, 'info').mockImplementation(() => undefined);
+        vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const adapterCreator = vi.fn() as any;
+        await manager.connect('guild-a', 'voice-a', adapterCreator);
+        manager.enqueue('guild-a', makeTrack('one'), null);
+        manager.enqueue('guild-a', makeTrack('two'), null);
+        manager.setAutoplay('guild-a', true);
+        await flushTransitions();
+        const snapshot = manager.getSnapshot('guild-a');
+        resources.release.mockClear();
+        const staleNetworking = connection.state.networking;
+        const replacement = createConnection(VoiceConnectionStatus.Connecting);
+        joinMock.mockReturnValue(replacement);
+
+        staleNetworking.emit('close', code);
+        await flushTransitions();
+
+        expect(connection.destroy).toHaveBeenCalledOnce();
+        expect(connection.configureNetworking).not.toHaveBeenCalled();
+        expect(replacement.configureNetworking).not.toHaveBeenCalled();
+        expect(joinMock).toHaveBeenLastCalledWith(expect.objectContaining({
+            guildId: 'guild-a', channelId: 'voice-a', adapterCreator
+        }));
+        expect(replacement.subscribe).toHaveBeenCalledWith(player);
+        expect(playerFactoryMock).toHaveBeenCalledOnce();
+        expect(manager.getSnapshot('guild-a')).toEqual(snapshot);
+        expect(manager.isAutoplayEnabled('guild-a')).toBe(true);
+        expect(resources.release).not.toHaveBeenCalled();
+        expect(player.stop).not.toHaveBeenCalled();
+
+        // Late events from the destroyed connection must not clear the new session.
+        connection.emit('stateChange', {}, { status: VoiceConnectionStatus.Destroyed });
+        staleNetworking.emit('close', 4021);
+        expect(manager.getActiveChannelId('guild-a')).toBe('voice-a');
+        const oldState = replacement.state;
+        replacement.state = { ...oldState, status: VoiceConnectionStatus.Ready };
+        replacement.emit('stateChange', oldState, replacement.state);
+        expect(await manager.connect('guild-a', 'voice-a', adapterCreator)).toBe(replacement);
+
+        // The replacement retains terminal-close handling too.
+        replacement.state.networking.emit('close', 4022);
+        expect(manager.getActiveChannelId('guild-a')).toBeUndefined();
+        expect(replacement.destroy).toHaveBeenCalledOnce();
+    });
+
+    it('interrupts an in-flight socket retry when Discord invalidates the session', async () => {
+        vi.useFakeTimers();
+        vi.spyOn(console, 'info').mockImplementation(() => undefined);
+        vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        let waitingSignal: AbortSignal | undefined;
+        entersStateMock.mockImplementationOnce((_target, _status, signal: AbortSignal) => {
+            waitingSignal = signal;
+            return new Promise((_resolve, reject) => {
+                signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+            });
+        });
+        const oldState = connection.state;
+        connection.state = { status: VoiceConnectionStatus.Signalling };
+        connection.emit('stateChange', oldState, connection.state);
+        await flushTransitions();
+        const retryNetworking = connection.state.networking;
+        const replacement = createConnection(VoiceConnectionStatus.Signalling);
+        joinMock.mockReturnValue(replacement);
+
+        retryNetworking.emit('close', 4006);
+        await flushTransitions();
+        expect(waitingSignal?.aborted).toBe(true);
+        await vi.advanceTimersByTimeAsync(2_000);
+
+        expect(joinMock).toHaveBeenCalledTimes(2);
+        expect(connection.destroy).toHaveBeenCalledOnce();
+        expect(entersStateMock).toHaveBeenLastCalledWith(replacement, VoiceConnectionStatus.Ready, expect.any(AbortSignal));
+        expect(manager.getActiveChannelId('guild-a')).toBe('voice-a');
+        expect(replacement.configureNetworking).not.toHaveBeenCalled();
+    });
+
+    it('bounds fresh-session retries and clears resources when they all fail', async () => {
+        vi.useFakeTimers();
+        vi.spyOn(console, 'info').mockImplementation(() => undefined);
+        vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        manager = createManager({
+            voiceRecoveryPolicy: new VoiceRecoveryPolicy({ maxAttempts: 2, initialBackoffMs: 10, attemptTimeoutMs: 20 })
+        });
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        manager.enqueue('guild-a', makeTrack('one'), null);
+        manager.enqueue('guild-a', makeTrack('two'), null);
+        await flushTransitions();
+        const replacements = [createConnection(VoiceConnectionStatus.Signalling), createConnection(VoiceConnectionStatus.Signalling)];
+        joinMock.mockReturnValueOnce(replacements[0]).mockReturnValueOnce(replacements[1]);
+        entersStateMock.mockImplementation((_target, _status, signal: AbortSignal) => new Promise((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+        }));
+
+        connection.state.networking.emit('close', 4006);
+        await vi.advanceTimersByTimeAsync(50);
+
+        expect(joinMock).toHaveBeenCalledTimes(3);
+        expect(manager.getActiveChannelId('guild-a')).toBeUndefined();
+        expect(replacements.every(item => item.destroy.mock.calls.length === 1)).toBe(true);
+        expect(resources.release).toHaveBeenCalledWith(expect.objectContaining({ metadata: expect.objectContaining({ id: 'one' }) }));
+        expect(resources.release).toHaveBeenCalledWith(expect.objectContaining({ metadata: expect.objectContaining({ id: 'two' }) }));
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('discards cached gateway credentials and sends a leave/join through the real voice adapter', async () => {
+        vi.spyOn(console, 'info').mockImplementation(() => undefined);
+        vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        const voice = await vi.importActual<typeof import('@discordjs/voice')>('@discordjs/voice');
+        const sendPayload = vi.fn().mockReturnValue(true);
+        const adapterCreator = vi.fn(() => ({ sendPayload, destroy: vi.fn() }));
+        joinMock.mockImplementation(voice.joinVoiceChannel);
+        playerFactoryMock.mockReturnValue(voice.createAudioPlayer());
+        // Stub readiness so no socket is opened; exercise the real connection and adapter lifecycle.
+        const original = await manager.connect('guild-a', 'voice-a', adapterCreator);
+        original.packets.state = { session_id: 'expired-session', user_id: 'bot', channel_id: 'voice-a' } as any;
+        original.packets.server = { endpoint: 'expired-endpoint', token: 'expired-token', guild_id: 'guild-a' };
+        const session = (manager as any).sessions.get('guild-a');
+        session.needsFreshVoiceSession = true;
+
+        await (manager as any).recoverConnection(session);
+
+        expect(original.state.status).toBe(VoiceConnectionStatus.Destroyed);
+        expect(session.connection).not.toBe(original);
+        expect(session.connection.packets).toEqual({});
+        expect(adapterCreator).toHaveBeenCalledTimes(2);
+        expect(sendPayload.mock.calls.map(([payload]) => payload.d.channel_id)).toEqual(['voice-a', null, 'voice-a']);
+        expect(session.connection.state.status).toBe(VoiceConnectionStatus.Signalling);
+        expect(manager.getActiveChannelId('guild-a')).toBe('voice-a');
+    });
+
+    it('does not start a queued recovery after the voice connection has already become ready', async () => {
+        vi.spyOn(console, 'info').mockImplementation(() => undefined);
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        const ready = connection.state;
+        const signalling = { status: VoiceConnectionStatus.Signalling };
+        connection.state = signalling;
+        connection.emit('stateChange', ready, signalling);
+        connection.state = ready;
+        connection.emit('stateChange', signalling, ready);
+        await flushTransitions();
+
+        expect(connection.configureNetworking).not.toHaveBeenCalled();
+        expect(connection.destroy).not.toHaveBeenCalled();
+    });
+
+    it('cancels a fresh voice join when the user disconnects during recovery', async () => {
+        vi.useFakeTimers();
+        vi.spyOn(console, 'info').mockImplementation(() => undefined);
+        vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        const replacement = createConnection(VoiceConnectionStatus.Signalling);
+        joinMock.mockReturnValue(replacement);
+        let waitingSignal: AbortSignal | undefined;
+        entersStateMock.mockImplementationOnce((_target, _status, signal: AbortSignal) => {
+            waitingSignal = signal;
+            return new Promise((_resolve, reject) => {
+                signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+            });
+        });
+
+        connection.state.networking.emit('close', 4006);
+        await flushTransitions();
+        manager.disconnect('guild-a');
+        await vi.advanceTimersByTimeAsync(120_000);
+
+        expect(waitingSignal?.aborted).toBe(true);
+        expect(joinMock).toHaveBeenCalledTimes(2);
+        expect(replacement.destroy).toHaveBeenCalledOnce();
+        expect(manager.getActiveChannelId('guild-a')).toBeUndefined();
+        expect(vi.getTimerCount()).toBe(0);
     });
 
     it('handles terminal networking closes and applies a temporary rate-limit cooldown', async () => {

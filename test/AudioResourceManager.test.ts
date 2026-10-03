@@ -161,6 +161,42 @@ describe('AudioResourceManager', () => {
         expect(handle.stop).not.toHaveBeenCalled();
     });
 
+    it.each([false, true])('ignores source failure after deliberate release (stream already closed: %s)', async (closedFirst) => {
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        const { handle, complete } = createHandle();
+        const resource = createResource();
+        createAudioResourceMock.mockReturnValue(resource);
+        const manager = new AudioResourceManager({ processes: createProcesses(handle) });
+        manager.createTrackResource(track);
+        if (closedFirst) resource.playStream.emit('close');
+        manager.release(resource);
+        complete({ status: 'failed', exitCode: null, signal: null, error: new YtDlpProcessError(
+            'yt-dlp stdout failed: Premature close', 'STDOUT_FAILURE', Buffer.alloc(0)
+        ) });
+        await handle.completion;
+
+        expect(getResourceFailure(resource)).toBeUndefined();
+        expect(errors).not.toHaveBeenCalled();
+        expect(handle.stop).toHaveBeenCalledOnce();
+    });
+
+    it('still reports genuine source failures after the play stream closes itself', async () => {
+        const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+        const { handle, complete } = createHandle();
+        const resource = createResource();
+        createAudioResourceMock.mockReturnValue(resource);
+        const manager = new AudioResourceManager({ processes: createProcesses(handle) });
+        manager.createTrackResource(track);
+        resource.playStream.emit('close');
+        complete({ status: 'failed', exitCode: 1, signal: null, error: new YtDlpProcessError(
+            'HTTP Error 403: Forbidden', 'PROCESS_FAILURE', Buffer.alloc(0)
+        ) });
+        await handle.completion;
+
+        expect(getResourceFailure(resource)).toBeInstanceOf(Error);
+        expect(errors).toHaveBeenCalledOnce();
+    });
+
     it('stops the source if audio resource construction throws', () => {
         const { handle } = createHandle();
         createAudioResourceMock.mockImplementation(() => { throw new Error('bad resource'); });
