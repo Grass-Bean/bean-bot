@@ -206,20 +206,6 @@ export class TrackResolver {
         };
     }
 
-    public async resolveAutoplay(
-        seed: TrackMetadata,
-        signal?: AbortSignal
-    ): Promise<TrackMetadata> {
-        const candidates = await this.resolveAutoplayCandidates(seed, 10, signal);
-        const candidate = candidates[0];
-        if (candidate) return candidate;
-
-        throw new TrackResolverError(
-            'No related track was available for autoplay.',
-            'INVALID_RESPONSE'
-        );
-    }
-
     public async resolveAutoplayCandidates(
         seed: TrackMetadata,
         limit: number,
@@ -227,11 +213,15 @@ export class TrackResolver {
     ): Promise<readonly TrackMetadata[]> {
         requireIntegerOption('limit', limit, 100);
         if (signal?.aborted) throw createCancellationError();
+        const videoId = getYouTubeVideoId(seed.url);
+        if (!videoId) return [];
+        const encodedId = encodeURIComponent(videoId);
+        const input = `https://www.youtube.com/watch?v=${encodedId}&list=RD${encodedId}`;
 
         let stdout: Buffer;
         try {
             ({ stdout } = await this.processes.collect(
-                this.createAutoplayArguments(this.createAutoplayInput(seed), limit),
+                this.createAutoplayArguments(input, limit),
                 {
                     signal,
                     timeoutMs: this.timeoutMs,
@@ -380,17 +370,6 @@ export class TrackResolver {
             input
         ];
     }
-
-    private createAutoplayInput(seed: TrackMetadata): string {
-        const videoId = getYouTubeVideoId(seed.url);
-        if (videoId) {
-            const encodedId = encodeURIComponent(videoId);
-            return `https://www.youtube.com/watch?v=${encodedId}&list=RD${encodedId}`;
-        }
-
-        return `ytsearch10:${seed.title} official audio`;
-    }
-
 }
 
 export const trackResolver = new TrackResolver();

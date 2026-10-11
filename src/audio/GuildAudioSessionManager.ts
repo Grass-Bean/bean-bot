@@ -312,8 +312,7 @@ export class GuildAudioSessionManager {
         this.clearInactivityTimer(session);
         this.autoplayCoordinator.enable(
             session.guildId,
-            session.autoplay,
-            () => !session.closing
+            session.autoplay
         );
         if (session.current?.metadata.kind === 'elevator') {
             const elevator = session.current;
@@ -736,8 +735,7 @@ export class GuildAudioSessionManager {
                 this.autoplayCoordinator.recordStartedTrack(
                     session.guildId,
                     session.autoplay,
-                    track,
-                    () => !session.closing
+                    track
                 );
                 this.startTrackWatchdog(session, resource);
                 this.notify(session, {
@@ -783,8 +781,7 @@ export class GuildAudioSessionManager {
             this.autoplayCoordinator.recordStartedTrack(
                 session.guildId,
                 session.autoplay,
-                track,
-                () => !session.closing
+                track
             );
             this.startTrackWatchdog(session, resource);
             this.notify(session, {

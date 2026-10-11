@@ -1,29 +1,16 @@
 import { AutoplaySelector } from './AutoplaySelector.js';
 import {
-    AUTOPLAY_CANDIDATE_CACHE_SIZE,
     AUTOPLAY_CANDIDATE_CACHE_TTL_MS,
     AUTOPLAY_CANDIDATE_LIMIT,
-    AUTOPLAY_PLAY_COUNT_WINDOW_SIZE,
-    AUTOPLAY_RECENT_TRACK_WINDOW_SIZE
+    AUTOPLAY_EXCLUSION_WINDOW_SIZE
 } from './autoplayConstants.js';
-import { getMediaKey, type MediaKey } from './mediaIdentity.js';
-import { TrackPlaybackHistory, TrackPlaybackScope } from './TrackPlaybackHistory.js';
+import { getMediaKey } from './mediaIdentity.js';
+import { TrackPlaybackHistory } from './TrackPlaybackHistory.js';
 import { trackResolver } from './TrackResolver.js';
 import { logger } from '../utility/logger.js';
+import type { AutoplaySessionState, AutoplayTrackResolver, TrackMetadata } from './types.js';
 
 const log = logger.child({ component: 'autoplay' }, { inheritContext: false });
-import type {
-    AutoplayCandidateBatch,
-    AutoplaySeed,
-    AutoplaySessionState,
-    AutoplayTrackResolver,
-    TrackMetadata
-} from './types.js';
-
-interface AutoplaySeedResolution {
-    batch?: AutoplayCandidateBatch;
-    error?: unknown;
-}
 
 export interface AutoplayCoordinatorOptions {
     resolver?: AutoplayTrackResolver;
@@ -42,34 +29,23 @@ export class AutoplayCoordinator {
     public createState(): AutoplaySessionState {
         return {
             enabled: false,
-            history: {
-                tracks: new TrackPlaybackHistory(
-                    AUTOPLAY_RECENT_TRACK_WINDOW_SIZE,
-                    AUTOPLAY_PLAY_COUNT_WINDOW_SIZE
-                )
-            },
-            candidateCache: new Map(),
-            candidateLookups: new Map()
+            history: new TrackPlaybackHistory(AUTOPLAY_EXCLUSION_WINDOW_SIZE)
         };
     }
 
-    public enable(
-        guildId: string,
-        state: AutoplaySessionState,
-        isActive: () => boolean
-    ): void {
+    public enable(guildId: string, state: AutoplaySessionState): void {
         state.enabled = true;
-        this.prefetchSeeds(guildId, state, isActive);
+        this.prefetchSeed(guildId, state);
     }
 
     public disable(state: AutoplaySessionState): void {
         state.enabled = false;
         this.cancelSelection(state);
-        this.cancelCandidateLookups(state);
+        this.cancelCandidateLookup(state);
     }
 
     public hasPlaybackHistory(state: AutoplaySessionState): boolean {
-        return state.history.tracks.size(TrackPlaybackScope.Recent) > 0;
+        return Boolean(state.history.lastYouTubeTrack);
     }
 
     public cancelSelection(state: AutoplaySessionState): void {
@@ -79,24 +55,23 @@ export class AutoplayCoordinator {
 
     public dispose(state: AutoplaySessionState): void {
         this.disable(state);
-        state.candidateCache.clear();
+        state.candidateCache = undefined;
     }
 
     public recordStartedTrack(
         guildId: string,
         state: AutoplaySessionState,
-        track: TrackMetadata,
-        isActive: () => boolean
+        track: TrackMetadata
     ): void {
-        const mediaKey = getMediaKey(track);
-        state.history.tracks.record({
-            mediaKey,
-            track: { ...track },
-            source: track.autoplay ? 'autoplay' : 'manual'
-        });
-
-        this.pruneCandidateLookups(state);
-        if (state.enabled) this.prefetchTrack(guildId, state, track);
+        const previousSeed = state.history.lastYouTubeTrack;
+        state.history.record(track);
+        const seed = state.history.lastYouTubeTrack;
+        if (seed && (!previousSeed || getMediaKey(previousSeed) !== getMediaKey(seed))) {
+            this.cancelSelection(state);
+            this.cancelCandidateLookup(state);
+            state.candidateCache = undefined;
+        }
+        if (state.enabled) this.prefetchSeed(guildId, state);
     }
 
     public async selectNext(
@@ -104,20 +79,17 @@ export class AutoplayCoordinator {
         state: AutoplaySessionState,
         canUseSelection: () => boolean
     ): Promise<TrackMetadata | undefined> {
-        if (!state.enabled) return undefined;
-
-        const seeds = this.selector.selectSeeds(state.history);
-        if (seeds.length === 0) return undefined;
+        const seed = state.history.lastYouTubeTrack;
+        if (!state.enabled || !seed) return undefined;
 
         this.cancelSelection(state);
         const controller = new AbortController();
         state.controller = controller;
 
         try {
-            const resolutions = await Promise.all(seeds.map(seed => (
-                this.resolveSeed(guildId, state, seed, controller.signal)
-            )));
-
+            // The shared lookup reports failures once for both prefetch and selection.
+            const candidates = await this.getOrStartCandidateLookup(guildId, state, seed)
+                .catch(() => []);
             if (
                 controller.signal.aborted ||
                 state.controller !== controller ||
@@ -125,35 +97,15 @@ export class AutoplayCoordinator {
                 !canUseSelection()
             ) return undefined;
 
-            const batches = resolutions.flatMap(({ batch }) => batch ? [batch] : []);
-            const selection = this.selector.selectCandidate(batches, state.history);
-            if (selection) {
-                log.debug('autoplay.selected', 'Autoplay candidate selected.', { guildId, trackId: selection.track.id, seedCount: seeds.length });
-                return selection.track;
+            const track = this.selector.selectCandidate(candidates, state.history);
+            if (track) {
+                log.debug('autoplay.selected', 'Autoplay candidate selected.', {
+                    guildId, trackId: track.id, seedTrackId: seed.id
+                });
             }
-
-            const resolutionError = resolutions.find(({ error }) => error)?.error;
-            if (resolutionError) {
-                log.warn('autoplay.no_candidates', 'No usable autoplay candidates after lookup failures.', { guildId });
-            }
-            return undefined;
+            return track;
         } finally {
             if (state.controller === controller) state.controller = undefined;
-        }
-    }
-
-    private async resolveSeed(
-        guildId: string,
-        state: AutoplaySessionState,
-        seed: AutoplaySeed,
-        signal: AbortSignal
-    ): Promise<AutoplaySeedResolution> {
-        try {
-            const candidates = await this.getOrStartCandidateLookup(guildId, state, seed.track);
-            if (signal.aborted) return {};
-            return { batch: { seed, candidates } };
-        } catch (error) {
-            return signal.aborted ? {} : { error };
         }
     }
 
@@ -163,17 +115,17 @@ export class AutoplayCoordinator {
         seed: TrackMetadata
     ): Promise<readonly TrackMetadata[]> {
         const seedKey = getMediaKey(seed);
-        const cached = this.getCachedCandidates(state, seedKey);
-        if (cached) {
+        const cached = state.candidateCache;
+        if (cached?.seedKey === seedKey && cached.expiresAt > Date.now()) {
             log.debug('autoplay.cache_hit', 'Using cached autoplay candidates.', { guildId, seedTrackId: seed.id });
-            return Promise.resolve(cached);
+            return Promise.resolve(cached.candidates);
         }
+        if (state.candidateLookup?.seedKey === seedKey) return state.candidateLookup.promise;
 
-        const active = state.candidateLookups.get(seedKey);
-        if (active) return active.promise;
-
+        this.cancelCandidateLookup(state);
         const controller = new AbortController();
         const lookup = {
+            seedKey,
             controller,
             promise: Promise.resolve<readonly TrackMetadata[]>([])
         };
@@ -183,93 +135,38 @@ export class AutoplayCoordinator {
             controller.signal
         ).then(candidates => {
             if (!controller.signal.aborted && candidates.length > 0) {
-                this.cacheCandidates(state, seedKey, candidates);
+                state.candidateCache = {
+                    seedKey,
+                    candidates,
+                    expiresAt: Date.now() + AUTOPLAY_CANDIDATE_CACHE_TTL_MS
+                };
             }
             return controller.signal.aborted ? [] : candidates;
         }).catch(error => {
             if (!controller.signal.aborted) {
-                log.error('autoplay.lookup_failed', 'Autoplay candidate lookup failed.', { guildId, seedTrackId: seed.id, title: seed.title, error });
+                log.error('autoplay.lookup_failed', 'Autoplay candidate lookup failed.', {
+                    guildId, seedTrackId: seed.id, title: seed.title, error
+                });
             } else {
-                log.debug('autoplay.lookup_cancelled', 'Autoplay candidate lookup cancelled.', { guildId, seedTrackId: seed.id });
+                log.debug('autoplay.lookup_cancelled', 'Autoplay candidate lookup cancelled.', {
+                    guildId, seedTrackId: seed.id
+                });
             }
             throw error;
         }).finally(() => {
-            if (state.candidateLookups.get(seedKey) === lookup) {
-                state.candidateLookups.delete(seedKey);
-            }
+            if (state.candidateLookup === lookup) state.candidateLookup = undefined;
         });
-        state.candidateLookups.set(seedKey, lookup);
-        void lookup.promise.catch(() => undefined);
+        state.candidateLookup = lookup;
         return lookup.promise;
     }
 
-    private prefetchSeeds(
-        guildId: string,
-        state: AutoplaySessionState,
-        isActive: () => boolean
-    ): void {
-        if (!state.enabled || !isActive()) return;
-
-        for (const seed of this.selector.selectSeeds(state.history)) {
-            this.prefetchTrack(guildId, state, seed.track);
-        }
+    private prefetchSeed(guildId: string, state: AutoplaySessionState): void {
+        const seed = state.history.lastYouTubeTrack;
+        if (seed) void this.getOrStartCandidateLookup(guildId, state, seed).catch(() => undefined);
     }
 
-    private prefetchTrack(
-        guildId: string,
-        state: AutoplaySessionState,
-        track: TrackMetadata
-    ): void {
-        // The shared lookup owns its error report, whether prefetch or selection consumes it.
-        void this.getOrStartCandidateLookup(guildId, state, track).catch(() => undefined);
-    }
-
-    private cancelCandidateLookups(state: AutoplaySessionState): void {
-        for (const lookup of state.candidateLookups.values()) lookup.controller.abort();
-        state.candidateLookups.clear();
-    }
-
-    private pruneCandidateLookups(state: AutoplaySessionState): void {
-        const retainedKeys = new Set(
-            this.selector.selectSeeds(state.history).map(seed => seed.mediaKey)
-        );
-        for (const [seedKey, lookup] of state.candidateLookups) {
-            if (retainedKeys.has(seedKey)) continue;
-            lookup.controller.abort();
-            state.candidateLookups.delete(seedKey);
-        }
-    }
-
-    private getCachedCandidates(
-        state: AutoplaySessionState,
-        seedKey: MediaKey
-    ): readonly TrackMetadata[] | undefined {
-        const cached = state.candidateCache.get(seedKey);
-        if (!cached) return undefined;
-        if (cached.expiresAt <= Date.now()) {
-            state.candidateCache.delete(seedKey);
-            return undefined;
-        }
-
-        state.candidateCache.delete(seedKey);
-        state.candidateCache.set(seedKey, cached);
-        return cached.candidates;
-    }
-
-    private cacheCandidates(
-        state: AutoplaySessionState,
-        seedKey: MediaKey,
-        candidates: readonly TrackMetadata[]
-    ): void {
-        state.candidateCache.delete(seedKey);
-        state.candidateCache.set(seedKey, {
-            candidates,
-            expiresAt: Date.now() + AUTOPLAY_CANDIDATE_CACHE_TTL_MS
-        });
-
-        while (state.candidateCache.size > AUTOPLAY_CANDIDATE_CACHE_SIZE) {
-            const oldestKey = state.candidateCache.keys().next().value as MediaKey;
-            state.candidateCache.delete(oldestKey);
-        }
+    private cancelCandidateLookup(state: AutoplaySessionState): void {
+        state.candidateLookup?.controller.abort();
+        state.candidateLookup = undefined;
     }
 }

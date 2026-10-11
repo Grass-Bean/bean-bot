@@ -120,17 +120,17 @@ describe('TrackResolver', () => {
             requestedBy: 'user-a'
         };
 
-        await expect(resolver.resolveAutoplay(seed)).resolves.toMatchObject({
+        await expect(resolver.resolveAutoplayCandidates(seed, 50)).resolves.toMatchObject([{
             kind: 'track',
             title: 'Related Song',
             url: 'https://www.youtube.com/watch?v=related',
             thumbnail: 'https://i.ytimg.com/vi/related/hqdefault.jpg',
             requestedBy: 'user-a',
             autoplay: true
-        });
+        }]);
         expect(processes.collect).toHaveBeenCalledWith(
             [
-                '--ignore-config', '--flat-playlist', '--playlist-end', '10', '--quiet',
+                '--ignore-config', '--flat-playlist', '--playlist-end', '50', '--quiet',
                 '--print', '%(.{title,webpage_url,duration,thumbnail})j', '--',
                 'https://www.youtube.com/watch?v=abc&list=RDabc'
             ],
@@ -166,7 +166,7 @@ describe('TrackResolver', () => {
         expect(vi.mocked(processes.collect).mock.calls[0]![0]).toContain('50');
     });
 
-    it('reports when autoplay has no usable recommendation', async () => {
+    it('returns no candidates when autoplay has no usable recommendation', async () => {
         vi.mocked(processes.collect).mockResolvedValue(collected(metadata()));
         const seed: TrackMetadata = {
             kind: 'track',
@@ -176,8 +176,18 @@ describe('TrackResolver', () => {
             requestedBy: 'user-a'
         };
 
-        await expect(new TrackResolver({}, processes).resolveAutoplay(seed))
-            .rejects.toMatchObject({ code: 'INVALID_RESPONSE' });
+        await expect(new TrackResolver({}, processes).resolveAutoplayCandidates(seed, 50))
+            .resolves.toEqual([]);
+    });
+
+    it('does not search for autoplay from non-YouTube media', async () => {
+        const seed: TrackMetadata = {
+            kind: 'track', id: 'clip', title: 'A Clip',
+            url: 'https://instagram.com/reel/clip', requestedBy: 'user-a'
+        };
+        await expect(new TrackResolver({}, processes).resolveAutoplayCandidates(seed, 50))
+            .resolves.toEqual([]);
+        expect(processes.collect).not.toHaveBeenCalled();
     });
 
     it.each([

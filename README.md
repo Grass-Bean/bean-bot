@@ -4,6 +4,8 @@ Successor of goon-bot
 
 honestly only good for media playing
 
+`/autoplay` continues playback from the most recently played YouTube track's mix when the queue is empty. It takes the first YouTube recommendation that is outside the last 50 plays. Both manually requested and autoplay tracks count toward that window; repeats count as separate plays. Other media leaves the YouTube seed in place. Without a YouTube seed or an eligible recommendation, the session returns to elevator music.
+
 ## Logging
 
 Logs go to the existing console output and are available through `docker compose logs -f bean-bot`. No log files or external collector are required.

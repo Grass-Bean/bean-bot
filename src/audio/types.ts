@@ -21,42 +21,6 @@ export interface TrackMetadata {
     autoplay?: boolean;
 }
 
-export type TrackPlaybackSource = 'manual' | 'autoplay';
-
-export interface TrackPlaybackEntry {
-    mediaKey: MediaKey;
-    track: TrackMetadata;
-    source: TrackPlaybackSource;
-}
-
-export interface EntropySource {
-    next(): number;
-}
-
-export type AutoplaySeedSource = TrackPlaybackSource;
-
-export interface AutoplaySeed {
-    track: TrackMetadata;
-    mediaKey: MediaKey;
-    source: AutoplaySeedSource;
-    weight: number;
-}
-
-export interface AutoplayCandidateBatch {
-    seed: AutoplaySeed;
-    candidates: readonly TrackMetadata[];
-}
-
-export interface AutoplaySelection {
-    track: TrackMetadata;
-    mediaKey: MediaKey;
-    youtubeRank: number;
-    seedSources: readonly AutoplaySeedSource[];
-    playCount: number;
-    youtubeScore: number;
-    finalScore: number;
-}
-
 export interface ElevatorMetadata {
     kind: 'elevator';
     id: 'elevator';
@@ -111,24 +75,22 @@ export interface GuildAudioSession {
     closing: boolean;
 }
 
-export interface AutoplaySessionHistory {
-    tracks: TrackPlaybackHistory;
-}
-
 export interface AutoplaySessionState {
     enabled: boolean;
     controller?: AbortController;
-    history: AutoplaySessionHistory;
-    candidateCache: Map<MediaKey, AutoplayCandidateCacheEntry>;
-    candidateLookups: Map<MediaKey, AutoplayCandidateLookup>;
+    history: TrackPlaybackHistory;
+    candidateCache?: AutoplayCandidateCacheEntry;
+    candidateLookup?: AutoplayCandidateLookup;
 }
 
 export interface AutoplayCandidateCacheEntry {
+    seedKey: MediaKey;
     candidates: readonly TrackMetadata[];
     expiresAt: number;
 }
 
 export interface AutoplayCandidateLookup {
+    seedKey: MediaKey;
     controller: AbortController;
     promise: Promise<readonly TrackMetadata[]>;
 }

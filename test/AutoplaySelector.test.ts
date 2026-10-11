@@ -1,195 +1,54 @@
 import { describe, expect, it } from 'vitest';
 import { AutoplaySelector } from '../src/audio/AutoplaySelector.js';
 import { TrackPlaybackHistory } from '../src/audio/TrackPlaybackHistory.js';
-import { getMediaKey } from '../src/audio/mediaIdentity.js';
-import type {
-    AutoplayCandidateBatch,
-    AutoplaySeed,
-    AutoplaySessionHistory,
-    EntropySource,
-    TrackMetadata
-} from '../src/audio/types.js';
+import type { TrackMetadata } from '../src/audio/types.js';
 
-const track = (id: string, autoplay = false): TrackMetadata => ({
-    kind: 'track',
-    id,
-    title: `Track ${id}`,
-    url: `https://youtube.com/watch?v=${id}`,
-    requestedBy: 'user-a',
-    autoplay
+const track = (id: string, url = `https://youtube.com/watch?v=${id}`): TrackMetadata => ({
+    kind: 'track', id, title: id, url, requestedBy: 'user-a', autoplay: true
 });
 
-const history = (recentCapacity = 50): AutoplaySessionHistory => ({
-    tracks: new TrackPlaybackHistory(recentCapacity, 200)
-});
-
-const record = (state: AutoplaySessionHistory, value: TrackMetadata): void => {
-    state.tracks.record({
-        mediaKey: getMediaKey(value),
-        track: value,
-        source: value.autoplay ? 'autoplay' : 'manual'
-    });
-};
-
-const seed = (
-    value: TrackMetadata,
-    weight = 1
-): AutoplaySeed => ({
-    track: value,
-    mediaKey: getMediaKey(value),
-    source: value.autoplay ? 'autoplay' : 'manual',
-    weight
-});
-
-const batch = (
-    value: AutoplaySeed,
-    candidates: readonly TrackMetadata[]
-): AutoplayCandidateBatch => ({ seed: value, candidates });
-
-class SequenceEntropy implements EntropySource {
-    public calls = 0;
-
-    public constructor(private readonly values: number[]) {}
-
-    public next(): number {
-        this.calls++;
-        return this.values.shift() ?? 0;
-    }
-}
+const selector = new AutoplaySelector();
 
 describe('AutoplaySelector', () => {
-    it('uses the last five playbacks as recency-decayed seeds', () => {
-        const state = history();
-        const played = [
-            track('zero'),
-            track('one', true),
-            track('two'),
-            track('three', true),
-            track('four'),
-            track('five', true)
-        ];
-        for (const value of played) record(state, value);
-
-        const seeds = new AutoplaySelector().selectSeeds(state);
-
-        expect(seeds.map(value => [value.track.id, value.source])).toEqual([
-            ['five', 'autoplay'],
-            ['four', 'manual'],
-            ['three', 'autoplay'],
-            ['two', 'manual'],
-            ['one', 'autoplay']
-        ]);
-        expect(seeds.map(value => value.weight)).toEqual([
-            1,
-            0.5,
-            0.5 ** 2,
-            0.5 ** 3,
-            0.5 ** 4
-        ]);
-    });
-
-    it('collates repeated playback identities into one stronger seed', () => {
-        const state = history();
-        const repeatedManual = track('repeated');
-        const other = track('other', true);
-        const repeatedAutoplay = track('repeated', true);
-        record(state, repeatedManual);
-        record(state, other);
-        record(state, repeatedAutoplay);
-
-        const seeds = new AutoplaySelector().selectSeeds(state);
-
-        expect(seeds).toHaveLength(2);
-        expect(seeds[0]).toEqual(expect.objectContaining({
-            track: repeatedAutoplay,
-            source: 'autoplay',
-            weight: 1 + 0.5 ** 2
-        }));
-        expect(seeds[1]).toEqual(expect.objectContaining({
-            track: other,
-            weight: 0.5
-        }));
-    });
-
-    it('promotes candidates supported by several recent seeds', () => {
-        const state = history();
-        const newest = seed(track('newest', true), 1);
-        const previous = seed(track('previous'), 0.5);
-        const single = track('single', true);
-        const shared = track('shared', true);
-        const selector = new AutoplaySelector(new SequenceEntropy([0]));
-
-        const selection = selector.selectCandidate([
-            batch(newest, [single, shared]),
-            batch(previous, [shared])
-        ], state);
-
-        expect(selection?.track).toBe(shared);
-        expect(selection?.seedSources).toEqual(['autoplay', 'manual']);
-        expect(selection?.youtubeScore).toBeGreaterThan(0.14);
-    });
-
-    it('softly penalizes plays outside the hard-exclusion horizon', () => {
-        const state = history();
-        const repeated = track('repeated', true);
-        const fresh = track('fresh', true);
-        record(state, repeated);
-        for (let index = 0; index < 50; index++) {
-            record(state, track(`history-${index}`, true));
-        }
-
-        const selection = new AutoplaySelector(new SequenceEntropy([0])).selectCandidate([
-            batch(seed(track('seed', true)), [repeated, fresh])
-        ], state);
-
-        expect(selection?.track).toBe(fresh);
-        expect(selection?.playCount).toBe(0);
-    });
-
-    it('uses one smooth entropy draw across the twenty highest-scoring candidates', () => {
-        const state = history();
-        const candidates = Array.from({ length: 25 }, (_, index) => track(`candidate-${index}`, true));
-        const entropy = new SequenceEntropy([0.999999]);
-        const selector = new AutoplaySelector(entropy);
-
-        const selection = selector.selectCandidate([
-            batch(seed(track('seed', true)), candidates)
-        ], state);
-
-        expect(selection?.track.id).toBe('candidate-19');
-        expect(entropy.calls).toBe(1);
-    });
-
-    it('smoothly reduces selection likelihood without a rank-five boundary', () => {
-        const state = history();
-        const candidates = Array.from({ length: 25 }, (_, index) => track(`candidate-${index}`, true));
-        const selector = new AutoplaySelector(new SequenceEntropy([0.9]));
-
-        const selection = selector.selectCandidate([
-            batch(seed(track('seed', true)), candidates)
-        ], state);
-        const selectedRank = Number(selection?.track.id.split('-').at(-1));
-
-        expect(selectedRank).toBeGreaterThanOrEqual(5);
-        expect(selectedRank).toBeLessThan(20);
-    });
-
-    it('hard-excludes recent tracks and consumes entropy only for a real draw', () => {
-        const state = history();
-        const candidates = [track('one', true), track('two', true)];
-        for (const candidate of candidates) record(state, candidate);
-        const entropy = new SequenceEntropy([0.5]);
-        const selector = new AutoplaySelector(entropy);
-
+    it('takes the first unplayed YouTube recommendation in provider order', () => {
+        const history = new TrackPlaybackHistory(50);
+        const seed = track('seed');
+        history.record(seed);
+        history.record({ ...track('played'), autoplay: false });
+        const first = track('first');
         expect(selector.selectCandidate([
-            batch(seed(track('seed', true)), candidates)
-        ], state)).toBeUndefined();
-        expect(entropy.calls).toBe(0);
+            seed,
+            track('same-video', 'https://youtu.be/played'),
+            track('clip', 'https://instagram.com/reel/clip'),
+            first,
+            track('second')
+        ], history)).toBe(first);
+    });
 
-        const fresh = track('fresh', true);
-        expect(selector.selectCandidate([
-            batch(seed(track('seed', true)), [fresh])
-        ], state)?.track).toBe(fresh);
-        expect(entropy.calls).toBe(1);
+    it('hard-excludes all of the last 50 plays and permits a track once it ages out', () => {
+        const history = new TrackPlaybackHistory(50);
+        const oldest = track('oldest');
+        const fresh = track('fresh');
+        history.record(oldest);
+        for (let index = 0; index < 49; index++) history.record(track(`history-${index}`));
+        expect(selector.selectCandidate([oldest, fresh], history)).toBe(fresh);
+        history.record(track('newest'));
+        expect(selector.selectCandidate([oldest, fresh], history)).toBe(oldest);
+    });
+
+    it('never chooses the seed itself, even after it leaves the exclusion window', () => {
+        const history = new TrackPlaybackHistory(1);
+        const seed = track('seed');
+        history.record(seed);
+        history.record(track('clip', 'https://instagram.com/reel/clip'));
+        expect(selector.selectCandidate([seed], history)).toBeUndefined();
+    });
+
+    it('returns no selection when recommendations are empty or all excluded', () => {
+        const history = new TrackPlaybackHistory(50);
+        const seed = track('seed');
+        history.record(seed);
+        expect(selector.selectCandidate([], history)).toBeUndefined();
+        expect(selector.selectCandidate([seed], history)).toBeUndefined();
     });
 });

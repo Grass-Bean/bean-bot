@@ -28,7 +28,6 @@ import {
     type GuildAudioSessionManagerOptions,
     VoiceConnectionRateLimitError
 } from '../src/audio/GuildAudioSessionManager.js';
-import { AutoplaySelector } from '../src/audio/AutoplaySelector.js';
 import { VoiceRecoveryPolicy } from '../src/audio/VoiceRecoveryPolicy.js';
 import type { AudioResourceManager } from '../src/audio/AudioResourceManager.js';
 import { reportResourceFailure } from '../src/audio/AudioResourceManager.js';
@@ -367,64 +366,55 @@ describe('GuildAudioSessionManager', () => {
         expect(manager.getActiveChannelId('guild-a')).toBeUndefined();
     });
 
-    it('aggregates cached lookups from recent playback seeds', async () => {
+    it('looks up only the last played YouTube track when autoplay is enabled', async () => {
         const first = makeTrack('first');
         const second = makeTrack('second');
         const related = { ...makeTrack('related'), autoplay: true };
         const autoplayResolver = {
             resolveAutoplayCandidates: vi.fn()
-                .mockResolvedValueOnce([{ ...first, autoplay: true }, { ...second, autoplay: true }])
-                .mockResolvedValueOnce([related])
+                .mockResolvedValueOnce([first, second, related])
                 .mockResolvedValue([])
         };
-        const selector = new AutoplaySelector({ next: () => 0.99 });
         manager = createManager({
-            autoplayResolver: autoplayResolver as AutoplayTrackResolver,
-            autoplaySelector: selector
+            autoplayResolver: autoplayResolver as AutoplayTrackResolver
         });
         await manager.connect('guild-a', 'voice-a', {} as any);
         manager.enqueue('guild-a', first, null);
         manager.enqueue('guild-a', second, null);
         await flushTransitions();
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
         manager.setAutoplay('guild-a', true);
-
-        player.emit(AudioPlayerStatus.Idle);
-        await flushTransitions();
         player.emit(AudioPlayerStatus.Idle);
         await flushTransitions();
 
-        expect(autoplayResolver.resolveAutoplayCandidates).toHaveBeenCalledTimes(3);
-        expect(autoplayResolver.resolveAutoplayCandidates.mock.calls[0]![0]).toEqual(first);
-        expect(autoplayResolver.resolveAutoplayCandidates.mock.calls[1]![0]).toEqual(second);
-        expect(autoplayResolver.resolveAutoplayCandidates.mock.calls[2]![0]).toBe(related);
+        expect(autoplayResolver.resolveAutoplayCandidates.mock.calls.map(call => call[0].id))
+            .toEqual(['second', 'related']);
         expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({ metadata: related }));
     });
 
-    it('reuses a bounded session candidate pool when a seed appears again', async () => {
+    it('advances the YouTube autoplay seed after each recommendation plays', async () => {
         const first = makeTrack('first');
         const second = makeTrack('second');
         const autoplayOne = { ...makeTrack('autoplay-one'), autoplay: true };
         const autoplayTwo = { ...makeTrack('autoplay-two'), autoplay: true };
-        const manualCandidate = { ...makeTrack('manual-candidate'), autoplay: true };
         const autoplayResolver = {
             resolveAutoplayCandidates: vi.fn().mockImplementation((seed: TrackMetadata) => {
                 if (seed.id === 'second') return Promise.resolve([autoplayOne]);
-                if (seed.id === 'first') return Promise.resolve([manualCandidate]);
-                return Promise.resolve([autoplayTwo]);
+                if (seed.id === 'autoplay-one') return Promise.resolve([autoplayTwo]);
+                return Promise.resolve([]);
             })
         };
         manager = createManager({
-            autoplayResolver: autoplayResolver as AutoplayTrackResolver,
-            autoplaySelector: new AutoplaySelector({ next: () => 0 })
+            autoplayResolver: autoplayResolver as AutoplayTrackResolver
         });
         await manager.connect('guild-a', 'voice-a', {} as any);
         manager.enqueue('guild-a', first, null);
         manager.enqueue('guild-a', second, null);
         await flushTransitions();
-        manager.setAutoplay('guild-a', true);
-
         player.emit(AudioPlayerStatus.Idle);
         await flushTransitions();
+        manager.setAutoplay('guild-a', true);
         player.emit(AudioPlayerStatus.Idle);
         await flushTransitions();
         expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({
@@ -434,12 +424,69 @@ describe('GuildAudioSessionManager', () => {
         player.emit(AudioPlayerStatus.Idle);
         await flushTransitions();
 
-        expect(autoplayResolver.resolveAutoplayCandidates).toHaveBeenCalledTimes(4);
         expect(autoplayResolver.resolveAutoplayCandidates.mock.calls.map(call => call[0].id))
-            .toEqual(['first', 'second', 'autoplay-one', 'autoplay-two']);
+            .toEqual(['second', 'autoplay-one', 'autoplay-two']);
         expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({
             metadata: autoplayTwo
         }));
+    });
+
+    it('keeps the last YouTube seed when a later Instagram clip plays', async () => {
+        const youtube = makeTrack('youtube');
+        const clip = { ...makeTrack('clip'), url: 'https://instagram.com/reel/clip' };
+        const related = { ...makeTrack('related'), autoplay: true };
+        const autoplayResolver = { resolveAutoplayCandidates: vi.fn().mockResolvedValue([related]) };
+        manager = createManager({ autoplayResolver });
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        manager.enqueue('guild-a', youtube, null);
+        manager.enqueue('guild-a', clip, null);
+        await flushTransitions();
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+        manager.setAutoplay('guild-a', true);
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+        expect(autoplayResolver.resolveAutoplayCandidates.mock.calls[0]![0]).toEqual(youtube);
+        expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({ metadata: related }));
+    });
+
+    it('returns to elevator music when every recommendation is excluded', async () => {
+        const seed = makeTrack('seed');
+        const autoplayResolver = { resolveAutoplayCandidates: vi.fn().mockResolvedValue([seed]) };
+        manager = createManager({ autoplayResolver });
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        manager.enqueue('guild-a', seed, null);
+        await flushTransitions();
+        manager.setAutoplay('guild-a', true);
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+        expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({
+            metadata: expect.objectContaining({ kind: 'elevator' })
+        }));
+    });
+
+    it('prioritizes a manual queue addition over an autoplay lookup already in progress', async () => {
+        const related = { ...makeTrack('related'), autoplay: true };
+        const manual = makeTrack('manual');
+        let finishLookup!: (tracks: readonly TrackMetadata[]) => void;
+        const autoplayResolver = {
+            resolveAutoplayCandidates: vi.fn()
+                .mockImplementationOnce(() => new Promise(resolve => { finishLookup = resolve; }))
+                .mockResolvedValue([])
+        };
+        manager = createManager({ autoplayResolver });
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        manager.enqueue('guild-a', makeTrack('seed'), null);
+        await flushTransitions();
+        manager.setAutoplay('guild-a', true);
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+
+        manager.enqueue('guild-a', manual, null);
+        finishLookup([related]);
+        await flushTransitions();
+        expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({ metadata: manual }));
+        expect(player.play.mock.calls.map(([resource]) => resource.metadata.id)).not.toContain('related');
     });
 
     it('finishes the current track before returning to elevator music when autoplay is disabled', async () => {

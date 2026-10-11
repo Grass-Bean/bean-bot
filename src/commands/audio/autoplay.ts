@@ -37,7 +37,7 @@ export default {
 
         await interaction.editReply({
             content: enabled
-                ? '♾️ **Autoplay on**\nRelated tracks will play when the queue is empty.'
+                ? '♾️ **Autoplay on**\nYouTube recommendations from the last played YouTube track will play when the queue is empty. The last 50 plays are excluded.'
                 : '⏹️ **Autoplay off**\nElevator music will return after the current track.',
             allowedMentions: { parse: [] }
         });
