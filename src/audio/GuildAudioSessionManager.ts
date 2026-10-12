@@ -309,7 +309,6 @@ export class GuildAudioSessionManager {
             return true;
         }
 
-        this.clearInactivityTimer(session);
         this.autoplayCoordinator.enable(
             session.guildId,
             session.autoplay
@@ -763,8 +762,6 @@ export class GuildAudioSessionManager {
             session.current
         ) return false;
 
-        this.clearInactivityTimer(session);
-
         let resource: BeanAudioResource | undefined;
         try {
             const track = await this.autoplayCoordinator.selectNext(
@@ -778,6 +775,8 @@ export class GuildAudioSessionManager {
             session.current = resource;
             log.info('audio.track_submitted', 'Autoplay track submitted to audio player.', { ...this.sessionFields(session), trackId: track.id, title: track.title, autoplay: true });
             session.player.play(resource);
+            // Empty or failed selections must not renew the elevator inactivity deadline.
+            this.clearInactivityTimer(session);
             this.autoplayCoordinator.recordStartedTrack(
                 session.guildId,
                 session.autoplay,

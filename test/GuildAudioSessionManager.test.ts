@@ -465,6 +465,132 @@ describe('GuildAudioSessionManager', () => {
         }));
     });
 
+    it.each(['empty', 'excluded', 'lookup failure', 'resource failure'])(
+        'disconnects on the original inactivity deadline across elevator loops after autoplay %s',
+        async (outcome) => {
+            vi.useFakeTimers();
+            vi.spyOn(console, 'error').mockImplementation(() => undefined);
+            const seed = makeTrack('seed');
+            const related = { ...makeTrack('related'), autoplay: true };
+            const autoplayResolver = {
+                resolveAutoplayCandidates: outcome === 'lookup failure'
+                    ? vi.fn().mockRejectedValue(new Error('lookup failed'))
+                    : vi.fn().mockResolvedValue(outcome === 'excluded' ? [seed]
+                        : outcome === 'resource failure' ? [related] : [])
+            };
+            manager = createManager({ autoplayResolver, inactivityTimeoutMs: 30 });
+            const channel = { send: vi.fn().mockResolvedValue(undefined) } as any;
+            await manager.connect('guild-a', 'voice-a', {} as any);
+            manager.enqueue('guild-a', seed, channel);
+            await flushTransitions();
+            if (outcome === 'resource failure') {
+                resources.createTrackResource.mockImplementation(() => { throw new Error('resource failed'); });
+            }
+            manager.setAutoplay('guild-a', true);
+            player.emit(AudioPlayerStatus.Idle);
+            await flushTransitions();
+
+            for (let loop = 0; loop < 2; loop++) {
+                await vi.advanceTimersByTimeAsync(10);
+                expect(manager.getActiveChannelId('guild-a')).toBe('voice-a');
+                player.emit(AudioPlayerStatus.Idle);
+                await flushTransitions();
+            }
+            expect(resources.createElevatorResource).toHaveBeenCalledTimes(3);
+            expect(channel.send.mock.calls.filter(([payload]: any[]) => payload.content?.includes('Queue finished')))
+                .toHaveLength(1);
+            const elevator = player.play.mock.calls.at(-1)![0];
+            await vi.advanceTimersByTimeAsync(10);
+
+            expect(manager.getActiveChannelId('guild-a')).toBeUndefined();
+            expect(manager.getSnapshot('guild-a')).toEqual({ pending: [] });
+            expect(manager.isAutoplayEnabled('guild-a')).toBe(false);
+            expect(connection.destroy).toHaveBeenCalledOnce();
+            expect(resources.release).toHaveBeenCalledWith(elevator);
+            expect(vi.getTimerCount()).toBe(0);
+        }
+    );
+
+    it('keeps the elevator inactivity deadline when enabling autoplay finds no candidates', async () => {
+        vi.useFakeTimers();
+        manager = createManager({
+            autoplayResolver: { resolveAutoplayCandidates: vi.fn().mockResolvedValue([]) },
+            inactivityTimeoutMs: 30
+        });
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        manager.enqueue('guild-a', makeTrack('seed'), null);
+        await flushTransitions();
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+
+        await vi.advanceTimersByTimeAsync(20);
+        manager.setAutoplay('guild-a', true);
+        await flushTransitions();
+        await vi.advanceTimersByTimeAsync(10);
+
+        expect(manager.getActiveChannelId('guild-a')).toBeUndefined();
+        expect(connection.destroy).toHaveBeenCalledOnce();
+    });
+
+    it('expires during a pending elevator autoplay retry and discards late candidates', async () => {
+        vi.useFakeTimers();
+        let finishLookup!: (tracks: readonly TrackMetadata[]) => void;
+        let lookupSignal!: AbortSignal;
+        const autoplayResolver = {
+            resolveAutoplayCandidates: vi.fn()
+                .mockResolvedValueOnce([])
+                .mockImplementation((_seed, _limit, signal) => {
+                    lookupSignal = signal;
+                    return new Promise(resolve => { finishLookup = resolve; });
+                })
+        };
+        manager = createManager({ autoplayResolver, inactivityTimeoutMs: 30 });
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        manager.enqueue('guild-a', makeTrack('seed'), null);
+        await flushTransitions();
+        manager.setAutoplay('guild-a', true);
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+        await vi.advanceTimersByTimeAsync(10);
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+        await vi.advanceTimersByTimeAsync(20);
+
+        expect(manager.getActiveChannelId('guild-a')).toBeUndefined();
+        expect(lookupSignal.aborted).toBe(true);
+        finishLookup([{ ...makeTrack('late'), autoplay: true }]);
+        await flushTransitions();
+        expect(resources.createTrackResource).toHaveBeenCalledOnce();
+        expect(resources.createElevatorResource).toHaveBeenCalledOnce();
+        expect(connection.destroy).toHaveBeenCalledOnce();
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('cancels the elevator inactivity deadline when an autoplay retry starts a track', async () => {
+        vi.useFakeTimers();
+        const related = { ...makeTrack('related'), autoplay: true };
+        manager = createManager({
+            autoplayResolver: {
+                resolveAutoplayCandidates: vi.fn().mockResolvedValueOnce([]).mockResolvedValue([related])
+            },
+            inactivityTimeoutMs: 30
+        });
+        await manager.connect('guild-a', 'voice-a', {} as any);
+        manager.enqueue('guild-a', makeTrack('seed'), null);
+        await flushTransitions();
+        manager.setAutoplay('guild-a', true);
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+        await vi.advanceTimersByTimeAsync(10);
+        player.emit(AudioPlayerStatus.Idle);
+        await flushTransitions();
+        await vi.advanceTimersByTimeAsync(30);
+
+        expect(player.play).toHaveBeenLastCalledWith(expect.objectContaining({ metadata: related }));
+        expect(manager.getActiveChannelId('guild-a')).toBe('voice-a');
+        expect(connection.destroy).not.toHaveBeenCalled();
+    });
+
     it('prioritizes a manual queue addition over an autoplay lookup already in progress', async () => {
         const related = { ...makeTrack('related'), autoplay: true };
         const manual = makeTrack('manual');
